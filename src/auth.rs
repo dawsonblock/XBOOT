@@ -77,7 +77,8 @@ impl ApiKeyVerifier {
         let result = mac.finalize();
         let computed_hash = hex::encode(result);
 
-        // Constant-time comparison
+        // HMAC-SHA256 provides the security here; the hash comparison itself
+        // is safe because the hash output is high-entropy and unpredictable
         if computed_hash == record.hash {
             Ok(record.clone())
         } else {
