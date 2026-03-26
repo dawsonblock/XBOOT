@@ -269,7 +269,7 @@ pub fn verify_template_artifacts(
     let state_meta = std::fs::metadata(&state_path)
         .with_context(|| format!("missing snapshot state file {}", state_path.display()))?;
     let mem_meta = std::fs::metadata(&mem_path)
-        .with_context(|| format!("missing snapshot memory file {}", mem_meta.display()))?;
+        .with_context(|| format!("missing snapshot memory file {}", mem_path.display()))?;
 
     if state_meta.len() == 0 {
         bail!("snapshot state file is empty: {}", state_path.display());
