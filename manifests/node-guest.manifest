@@ -1,0 +1,9 @@
+# Runtime manifest for the Node guest image.
+language=node
+base_rootfs=REQUIRED
+base_rootfs_sha256=REQUIRED
+packages=busybox,nodejs
+entrypoint=/init
+worker=/zeroboot/worker_node.js
+runtime_binary=/usr/bin/node
+runtime_version=REQUIRED

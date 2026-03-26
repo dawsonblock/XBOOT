@@ -1,0 +1,27 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  sanity:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: python syntax
+        run: python -m py_compile guest/worker.py sdk/python/zeroboot/client.py scripts/make_api_keys.py
+      - name: node syntax
+        run: node --check guest/worker_node.js
+      - name: shell syntax
+        run: bash -n verify.sh deploy/deploy.sh scripts/build_guest_rootfs.sh scripts/build_rootfs_image.sh scripts/preflight.sh
+      - name: unit tests
+        run: python -m unittest discover -s tests -p 'test_*.py'
+      - name: cargo tests
+        run: cargo test --locked

@@ -1,0 +1,12 @@
+target/
+workdir*/
+*.pyc
+__pycache__/
+.pytest_cache/
+.venv/
+.env
+*.ext4
+*.sha256
+*.img
+*.log
+/var/lib/zeroboot/

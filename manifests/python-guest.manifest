@@ -1,0 +1,9 @@
+# Runtime manifest for the Python guest image.
+language=python
+base_rootfs=REQUIRED
+base_rootfs_sha256=REQUIRED
+packages=busybox,python3
+entrypoint=/init
+worker=/zeroboot/worker.py
+runtime_binary=/usr/bin/python3
+runtime_version=REQUIRED
