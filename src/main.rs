@@ -63,6 +63,9 @@ fn validate_snapshot_workdir(
     let keyring_path = config
         .and_then(|cfg| cfg.artifacts.keyring_path.as_ref())
         .map(|p| p.as_path());
+    let require_signatures = config
+        .map(|cfg| cfg.artifacts.require_template_signatures)
+        .unwrap_or(false);
     let mode = config
         .map(|cfg| {
             if matches!(cfg.auth_mode, AuthMode::Prod) {
@@ -78,6 +81,7 @@ fn validate_snapshot_workdir(
         allowed_firecracker_version,
         allowed_firecracker_binary_sha256,
         require_hashes,
+        require_signatures,
         mode,
         keyring_path,
     )?;
@@ -101,6 +105,9 @@ fn load_snapshot(
     let keyring_path = config
         .and_then(|cfg| cfg.artifacts.keyring_path.as_ref())
         .map(|p| p.as_path());
+    let require_signatures = config
+        .map(|cfg| cfg.artifacts.require_template_signatures)
+        .unwrap_or(false);
     let mode = config
         .map(|cfg| {
             if matches!(cfg.auth_mode, AuthMode::Prod) {
@@ -117,6 +124,7 @@ fn load_snapshot(
         allowed_firecracker_version,
         allowed_firecracker_binary_sha256,
         require_hashes,
+        require_signatures,
         mode,
         keyring_path,
     )?;

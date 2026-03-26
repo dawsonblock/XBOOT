@@ -170,7 +170,7 @@ pub fn resolve_path_confined(workdir: &Path, raw: &str) -> Result<PathBuf> {
 /// In Prod mode, this enforces:
 /// - No missing schema_version
 /// - promotion_channel must be "prod" (not "dev" or "staging")
-/// - Signature verification when ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES is set
+/// - Signature verification when require_signatures is true
 /// - Firecracker binary hash validation
 /// - Path confinement (no escaping paths)
 /// - Protocol version matching
@@ -181,6 +181,7 @@ pub fn verify_template_artifacts(
     allowed_firecracker_version: Option<&str>,
     allowed_firecracker_binary_sha256: Option<&str>,
     require_hashes: bool,
+    require_signatures: bool,
     mode: VerificationMode,
     keyring_path: Option<&Path>,
 ) -> Result<TemplateManifest> {
@@ -204,7 +205,7 @@ pub fn verify_template_artifacts(
         }
 
         // 3. Require signatures if configured
-        if std::env::var("ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES").is_ok() {
+        if require_signatures {
             if manifest.manifest_signature.is_none() {
                 bail!("prod mode requires template signatures but none present");
             }
