@@ -210,4 +210,41 @@ mod tests {
 
         assert!(verifier.verify(&wrong_token).is_err());
     }
+
+    #[test]
+    fn test_verify_disabled_key() {
+        let pepper = "test-pepper";
+        let (_, mut record) = generate_api_key("test-key", pepper);
+
+        // Disable the key
+        record.disabled_at = Some(1234567890);
+
+        let mut map = HashMap::new();
+        map.insert(record.prefix.clone(), record);
+
+        let verifier = ApiKeyVerifier {
+            records: Arc::new(map),
+            pepper: pepper.to_string(),
+        };
+
+        // Create a valid token for the now-disabled key
+        let (token, _) = generate_api_key("test-key", pepper);
+        assert!(verifier.verify(&token).is_err());
+    }
+
+    #[test]
+    fn test_verify_malformed_token() {
+        let pepper = "test-pepper";
+        let verifier = ApiKeyVerifier {
+            records: Arc::new(HashMap::new()),
+            pepper: pepper.to_string(),
+        };
+
+        // Missing secret part
+        assert!(verifier.verify("just-prefix").is_err());
+        // Empty token
+        assert!(verifier.verify("").is_err());
+        // Multiple dots
+        assert!(verifier.verify("a.b.c").is_err());
+    }
 }

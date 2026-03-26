@@ -371,3 +371,122 @@ pub fn verify_template_artifacts(
 
     Ok(manifest)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn create_test_manifest(
+        workdir: &Path,
+        promotion_channel: &str,
+        schema_version: Option<&str>,
+    ) -> Result<PathBuf> {
+        let mut manifest = serde_json::json!({
+            "promotion_channel": promotion_channel,
+            "kernel_path": "vmlinux",
+            "rootfs_path": "rootfs.ext4",
+            "snapshot_mem_path": "snapshot.mem",
+            "snapshot_state_path": "snapshot.vmstate",
+        });
+        if let Some(v) = schema_version {
+            manifest["schema_version"] = serde_json::json!(v);
+        }
+        let manifest_path = workdir.join("template.manifest.json");
+        fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+        Ok(manifest_path)
+    }
+
+    #[test]
+    fn test_prod_rejects_missing_schema_version() {
+        let td = TempDir::new().unwrap();
+        create_test_manifest(td.path(), "prod", None).unwrap();
+
+        let result = verify_template_artifacts(
+            td.path(),
+            None,
+            None,
+            None,
+            false,
+            false,
+            VerificationMode::Prod,
+            None,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("schema_version"), "expected schema_version error: {}", err);
+    }
+
+    #[test]
+    fn test_prod_rejects_wrong_promotion_channel() {
+        let td = TempDir::new().unwrap();
+        create_test_manifest(td.path(), "dev", Some("1.0")).unwrap();
+
+        let result = verify_template_artifacts(
+            td.path(),
+            None,
+            None,
+            None,
+            false,
+            false,
+            VerificationMode::Prod,
+            None,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("promotion_channel"), "expected promotion_channel error: {}", err);
+    }
+
+    #[test]
+    fn test_dev_accepts_missing_schema() {
+        let td = TempDir::new().unwrap();
+        create_test_manifest(td.path(), "dev", None).unwrap();
+
+        // Dev mode should not require schema_version
+        let result = verify_template_artifacts(
+            td.path(),
+            None,
+            None,
+            None,
+            false,
+            false,
+            VerificationMode::Dev,
+            None,
+        );
+
+        // Should pass manifest validation (will fail on missing files, not schema)
+        // We're just checking schema isn't required
+        assert!(result.is_err()); // Missing files, but NOT schema error
+        let err = result.unwrap_err().to_string();
+        assert!(!err.contains("schema_version"), "dev mode should not require schema: {}", err);
+    }
+
+    #[test]
+    fn test_prod_accepts_valid_manifest() {
+        let td = TempDir::new().unwrap();
+        create_test_manifest(td.path(), "prod", Some("1.0")).unwrap();
+
+        // Create dummy files
+        fs::write(td.path().join("vmlinux"), "kernel").unwrap();
+        fs::write(td.path().join("rootfs.ext4"), "rootfs").unwrap();
+        fs::write(td.path().join("snapshot.mem"), "mem").unwrap();
+        fs::write(td.path().join("snapshot.vmstate"), "state").unwrap();
+
+        let result = verify_template_artifacts(
+            td.path(),
+            None,
+            None,
+            None,
+            false,
+            false,
+            VerificationMode::Prod,
+            None,
+        );
+
+        // Should succeed with valid manifest and present files
+        assert!(result.is_ok(), "valid prod manifest should pass: {:?}", result);
+    }
+}
