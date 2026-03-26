@@ -315,14 +315,19 @@ pub fn create_template_snapshot(
     let mem_bytes = std::fs::metadata(&mem_path)?.len();
     let fc_version = firecracker_version();
     let manifest = template_manifest::TemplateManifest {
-        // Identity fields
+        // Core identity fields
         schema_version: Some(1),
-        template_id: Some(uuid::Uuid::new_v7(uuid::Timestamp::now()).to_string()),
-        build_id: Some(uuid::Uuid::new_v7(uuid::Timestamp::now()).to_string()),
-        artifact_set_id: Some(uuid::Uuid::new_v7(uuid::Timestamp::now()).to_string()),
+        template_id: Some(uuid::Uuid::new_v4().to_string()),
+        build_id: Some(uuid::Uuid::new_v4().to_string()),
+        artifact_set_id: Some(uuid::Uuid::new_v4().to_string()),
         
         // Trust and promotion (default to dev for newly created templates)
         promotion_channel: Some("dev".to_string()),
+        
+        // Trust - newly created templates are not yet signed
+        signer_key_id: None,
+        manifest_signature: None,
+        manifest_signed_fields: None,
         
         // Build provenance
         built_from_git_rev: std::env::var("ZEROBOOT_GIT_REV").ok(),

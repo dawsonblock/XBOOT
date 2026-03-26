@@ -19,11 +19,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 nix = { version = "0.29", features = ["fs", "mman", "ioctl"] }
 anyhow = "1"
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
-hmac-sha256 = "2"
+hmac-sha256 = "1"
 ring = "0.17"
 base64 = "0.22"
+hex = "0.4"
 
 [profile.release]
 opt-level = 3

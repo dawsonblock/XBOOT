@@ -603,7 +603,7 @@ pub async fn exec_handler(
         Err(e) => return e.into_response(),
     };
 
-    let request_id = uuid::Uuid::now_v7().to_string();
+    let request_id = uuid::Uuid::new_v4().to_string();
     let rid = request_id.clone();
     let client_ip = extract_client_ip(&state, &headers, addr);
     let masked_key = mask_api_key(&api_key);
@@ -655,13 +655,15 @@ pub async fn batch_handler(
     for (index, exec_req) in req.executions.into_iter().enumerate() {
         let permit = permits.remove(0);
         let state_for_task = state.clone();
-        let request_id = uuid::Uuid::now_v7().to_string();
+        let request_id = uuid::Uuid::new_v4().to_string();
         let rid = request_id.clone();
         let req_for_log = exec_req.clone();
+        let request_id_for_task = uuid::Uuid::new_v4().to_string();
+        let rid_for_task = request_id_for_task.clone();
         tasks.push(tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let response = execute_code_internal(&state_for_task, &exec_req, &rid, ExecutionMode::User);
-            (index, request_id, req_for_log, response)
+            let response = execute_code_internal(&state_for_task, &exec_req, &rid_for_task, ExecutionMode::User);
+            (index, request_id_for_task, req_for_log, response)
         }));
     }
 

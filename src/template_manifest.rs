@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use hex;
 
 use crate::protocol;
 use crate::signing;
@@ -103,7 +104,7 @@ pub fn sha256_hex(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn verify_hash_if_present(path: &Path, expected: Option<&str>, require_hashes: bool, label: &str) -> Result<()> {

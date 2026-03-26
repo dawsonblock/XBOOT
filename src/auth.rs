@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::io::Write;
 
 /// API key record stored on server - contains hash, not the actual key
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,7 +75,8 @@ impl ApiKeyVerifier {
         // Compute expected hash: HMAC-SHA256(pepper, prefix:secret)
         let mut mac = hmac_sha256::HMAC::new(self.pepper.as_bytes());
         mac.update(format!("{}:{}", prefix, secret).as_bytes());
-        let computed_hash = format!("{:x}", mac.finalize());
+        let result = mac.finalize();
+        let computed_hash = hex::encode(result);
         
         // Constant-time comparison
         if computed_hash == record.hash {
@@ -132,7 +134,8 @@ pub fn generate_api_key(label: &str, pepper: &str) -> (String, ApiKeyRecord) {
     // Compute hash: HMAC-SHA256(pepper, prefix:secret)
     let mut mac = hmac_sha256::HMAC::new(pepper.as_bytes());
     mac.update(format!("{}:{}", prefix, secret).as_bytes());
-    let hash = format!("{:x}", mac.finalize());
+    let result = mac.finalize();
+    let hash = hex::encode(result);
     
     let record = ApiKeyRecord {
         id,

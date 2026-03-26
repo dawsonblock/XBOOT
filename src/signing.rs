@@ -207,7 +207,7 @@ pub fn verify_manifest_signature(
                 
                 let public_key = UnparsedPublicKey::new(&ED25519, &key.public_key);
                 public_key.verify(signed_content.as_bytes(), &signature_bytes)
-                    .context("signature verification failed")?;
+                    .map_err(|e| anyhow::anyhow!("signature verification failed: {:?}", e))?;
             }
             _ => {
                 bail!("unsupported signature algorithm: {}", key.algorithm);
@@ -234,24 +234,28 @@ pub fn verify_manifest_signature_stub(
 
 /// Generate a new signing key pair (for key rotation)
 pub fn generate_key_pair() -> Result<(Vec<u8>, Vec<u8>)> {
-    use ring::signature::{Ed25519KeyPair, PKCS8_SERIALIZED_PERSONALIZATION_LEN};
+    use ring::signature::{Ed25519KeyPair, KeyPair};
     
     let rng = ring::rand::SystemRandom::new();
     let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng)
-        .context("failed to generate key pair")?;
+        .map_err(|e| anyhow::anyhow!("failed to generate key pair: {:?}", e))?;
     
+    // The pkcs8_bytes contains both private and public key
+    // We can extract the public key from it by parsing
     let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref())
-        .context("failed to parse generated key")?;
+        .map_err(|e| anyhow::anyhow!("failed to parse generated key: {:?}", e))?;
     
-    Ok(key_pair.pkcs8().to_vec())
+    // Return pkcs8 bytes (contains both keys) and public key separately
+    let public_key = key_pair.public_key().as_ref().to_vec();
+    Ok((pkcs8_bytes.as_ref().to_vec(), public_key))
 }
 
 /// Export public key from a key pair
 pub fn export_public_key(key_pair_bytes: &[u8]) -> Result<Vec<u8>> {
-    use ring::signature::Ed25519KeyPair;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
     
     let key_pair = Ed25519KeyPair::from_pkcs8(key_pair_bytes)
-        .context("invalid key pair")?;
+        .map_err(|e| anyhow::anyhow!("invalid key pair: {:?}", e))?;
     
     Ok(key_pair.public_key().as_ref().to_vec())
 }
@@ -261,7 +265,7 @@ pub fn sign_data(key_pair_bytes: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     use ring::signature::Ed25519KeyPair;
     
     let key_pair = Ed25519KeyPair::from_pkcs8(key_pair_bytes)
-        .context("invalid key pair")?;
+        .map_err(|e| anyhow::anyhow!("invalid key pair: {:?}", e))?;
     
     Ok(key_pair.sign(data).as_ref().to_vec())
 }

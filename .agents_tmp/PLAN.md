@@ -1,11 +1,10 @@
-# XBOOT Production-Readiness Execution Plan
+# XBOOT Production-Readiness Repair Plan
 
-## Core Principle: Fix Build Truth, Trust Truth, and Deployment Truth
+## Executive Summary
 
-The key rule: **Do not add features first.**
-Fix build truth, trust truth, and deployment truth in that order.
+This plan addresses the concrete contradictions blocking XBOOT from being a trustworthy production system. The repo has a solid core architecture but suffers from implementation inconsistencies that break critical paths.
 
-Right now the VM core is the strongest part of the system. The outer shell is where the repo lies to itself.
+**Key Principle:** Fix the lies first, then add features.
 
 ## Target State
 
@@ -499,15 +498,7 @@ This is the order to execute without deviating:
 - Autoscaling
 - Operator UI
 
-Those are downstream. The repo first needs one truthful spine.mpty() {
-                    eprintln!("guest: {}", trimmed);
-                }
-                if trimmed.starts_with(GUEST_READY_PREFIX) {
-                    let ready = parse_guest_ready_line(trimmed)?;
-                    if ready.protocol_version != protocol::PROTOCOL_VERSION {
-                        bail!(
-                            "guest protocol mismatch: expected {}, got {}",
-                            protocol::PROTOCOL_VERSION,
+Those are downstream. The repo first needs one truthful spine.
                             ready.protocol_version
                         );
                     }

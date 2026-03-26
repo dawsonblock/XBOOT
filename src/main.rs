@@ -51,7 +51,8 @@ fn validate_snapshot_workdir(workdir: &str, expected_language: Option<&str>, con
     let allowed_firecracker_binary_sha256 = config
         .and_then(|cfg| cfg.artifacts.allowed_firecracker_binary_sha256.as_deref());
     let keyring_path = config
-        .and_then(|cfg| cfg.artifacts.keyring_path.as_ref());
+        .and_then(|cfg| cfg.artifacts.keyring_path.as_ref())
+        .map(|p| p.as_path());
     let mode = config
         .map(|cfg| if matches!(cfg.auth_mode, AuthMode::Prod) { VerificationMode::Prod } else { VerificationMode::Dev })
         .unwrap_or(VerificationMode::Dev);
@@ -76,7 +77,8 @@ fn load_snapshot(workdir: &str, expected_language: Option<&str>, config: Option<
     let allowed_firecracker_binary_sha256 = config
         .and_then(|cfg| cfg.artifacts.allowed_firecracker_binary_sha256.as_deref());
     let keyring_path = config
-        .and_then(|cfg| cfg.artifacts.keyring_path.as_ref());
+        .and_then(|cfg| cfg.artifacts.keyring_path.as_ref())
+        .map(|p| p.as_path());
     let mode = config
         .map(|cfg| if matches!(cfg.auth_mode, AuthMode::Prod) { VerificationMode::Prod } else { VerificationMode::Dev })
         .unwrap_or(VerificationMode::Dev);
