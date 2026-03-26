@@ -48,11 +48,35 @@ XBOOT is a **production-ready** VM sandbox system that provides sub-millisecond 
 
 ## Quick Start
 
+> **Important:** This repo is the **runtime** for XBOOT. It does **not** include guest artifacts (kernel, rootfs) by default. You need to provide these or build them.
+
+### Option A: Code-Only Testing
+
+For contributors without KVM access or guest artifacts:
+
+```bash
+# Run unit tests
+cargo test --locked
+python -m unittest discover -s tests -v
+
+# Run lints
+cargo clippy
+cargo fmt --check
+```
+
+### Option B: Full System Bring-Up
+
+Prerequisites:
+- **KVM-capable host** with root access (for `/dev/kvm`)
+- **Firecracker binary** (download from releases, set `$ZEROBOOT_FIRECRACKER_PATH`)
+- **Linux kernel** (vmlinux for Firecracker, e.g., `vmlinux-fc-5.10.0-amd-virt`)
+- **Guest rootfs** (ext4 image with Python/Node runtime)
+
 ```bash
 # Build the server
 make build
 
-# Build guest images
+# Build guest images (requires debootstrap/Docker)
 make guest-python
 make image-python
 make template-python
@@ -63,6 +87,18 @@ make template-python
 # Or with test execution
 ./target/release/zeroboot test-exec /path/to/template python "print(1+1)"
 ```
+
+### Required Environment Variables
+
+For production deployments, set these:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ZEROBOOT_AUTH_MODE` | `dev` or `prod` | `dev` |
+| `ZEROBOOT_API_KEY_PEPPER_FILE` | Path to pepper secret | `/etc/zeroboot/pepper` |
+| `ZEROBOOT_REQUIRE_TEMPLATE_HASHES` | Enforce template hash verification | `false` in dev |
+| `ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES` | Enforce template signatures | `false` in dev |
+| `ZEROBOOT_KEYRING_PATH` | Path to signing keyring | none |
 
 ---
 
