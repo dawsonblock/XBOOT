@@ -6,6 +6,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use crate::protocol;
+use crate::signing;
 
 pub const TEMPLATE_MANIFEST_FILENAME: &str = "template.manifest.json";
 
@@ -176,6 +177,7 @@ pub fn verify_template_artifacts(
     allowed_firecracker_binary_sha256: Option<&str>,
     require_hashes: bool,
     mode: VerificationMode,
+    keyring_path: Option<&Path>,
 ) -> Result<TemplateManifest> {
     let manifest = read_manifest(workdir)?;
 
@@ -201,10 +203,29 @@ pub fn verify_template_artifacts(
             if manifest.manifest_signature.is_none() {
                 bail!("prod mode requires template signatures but none present");
             }
-            // TODO: actual signature verification via signing.rs module
-            if manifest.signer_key_id.is_none() {
-                bail!("template has signature but missing signer_key_id");
-            }
+            
+            // Real signature verification
+            let signer_key_id = manifest.signer_key_id.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("template has signature but missing signer_key_id"))?;
+            let signature = manifest.manifest_signature.as_ref().unwrap();
+            
+            // Serialize manifest to JSON for verification
+            let manifest_json = serde_json::to_string(&manifest)?;
+            
+            // Load keyring if path provided
+            let keyring = if let Some(path) = keyring_path {
+                Some(signing::load_keyring(path)?)
+            } else {
+                None
+            };
+            
+            // Verify the signature
+            signing::verify_manifest_signature(
+                &manifest_json,
+                signer_key_id,
+                signature,
+                keyring.as_ref(),
+            ).map_err(|e| anyhow::anyhow!("signature verification failed: {}", e))?;
         }
 
         // 4. Validate Firecracker binary hash if configured

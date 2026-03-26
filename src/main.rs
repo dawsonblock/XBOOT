@@ -50,6 +50,8 @@ fn validate_snapshot_workdir(workdir: &str, expected_language: Option<&str>, con
         .and_then(|cfg| cfg.artifacts.allowed_firecracker_version.as_deref());
     let allowed_firecracker_binary_sha256 = config
         .and_then(|cfg| cfg.artifacts.allowed_firecracker_binary_sha256.as_deref());
+    let keyring_path = config
+        .and_then(|cfg| cfg.artifacts.keyring_path.as_ref());
     let mode = config
         .map(|cfg| if matches!(cfg.auth_mode, AuthMode::Prod) { VerificationMode::Prod } else { VerificationMode::Dev })
         .unwrap_or(VerificationMode::Dev);
@@ -60,6 +62,7 @@ fn validate_snapshot_workdir(workdir: &str, expected_language: Option<&str>, con
         allowed_firecracker_binary_sha256,
         require_hashes,
         mode,
+        keyring_path,
     )?;
     Ok(())
 }
@@ -72,6 +75,8 @@ fn load_snapshot(workdir: &str, expected_language: Option<&str>, config: Option<
         .and_then(|cfg| cfg.artifacts.allowed_firecracker_version.as_deref());
     let allowed_firecracker_binary_sha256 = config
         .and_then(|cfg| cfg.artifacts.allowed_firecracker_binary_sha256.as_deref());
+    let keyring_path = config
+        .and_then(|cfg| cfg.artifacts.keyring_path.as_ref());
     let mode = config
         .map(|cfg| if matches!(cfg.auth_mode, AuthMode::Prod) { VerificationMode::Prod } else { VerificationMode::Dev })
         .unwrap_or(VerificationMode::Dev);
@@ -83,6 +88,7 @@ fn load_snapshot(workdir: &str, expected_language: Option<&str>, config: Option<
         allowed_firecracker_binary_sha256,
         require_hashes,
         mode,
+        keyring_path,
     )?;
     
     // Use paths from manifest, resolved with confinement in prod mode
@@ -287,17 +293,46 @@ fn cmd_fork_bench(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn load_api_keys(config: &ServerConfig) -> Result<Vec<String>> {
-    match std::fs::read_to_string(&config.api_keys_file) {
-        Ok(data) => Ok(serde_json::from_str::<Vec<String>>(&data).unwrap_or_default()),
-        Err(e) => match config.auth_mode {
-            AuthMode::Dev => {
-                eprintln!("  Dev auth mode: no API keys file at {}, continuing with auth disabled", config.api_keys_file.display());
-                Ok(Vec::new())
+fn load_api_key_verifier(config: &ServerConfig) -> Result<Option<auth::ApiKeyVerifier>> {
+    // In dev mode, allow no keys
+    if matches!(config.auth_mode, AuthMode::Dev) {
+        // Try to load if file exists, but don't fail if missing
+        if let Ok(pepper) = std::fs::read_to_string(&config.api_key_pepper_file) {
+            let pepper = pepper.trim();
+            if !pepper.is_empty() {
+                match auth::ApiKeyVerifier::load_from_file(&config.api_keys_file, pepper) {
+                    Ok(verifier) => {
+                        eprintln!("  Loaded {} API keys from {}", verifier.len(), config.api_keys_file.display());
+                        return Ok(Some(verifier));
+                    }
+                    Err(e) => {
+                        eprintln!("  Dev mode: could not load API keys ({}), continuing with auth disabled", e);
+                    }
+                }
             }
-            AuthMode::Prod => bail!("auth mode is prod but API keys file is missing or unreadable: {}", e),
-        },
+        }
+        eprintln!("  Dev auth mode: no pepper or keys configured, continuing with auth disabled");
+        return Ok(None);
     }
+    
+    // In prod mode, require both pepper and keys
+    let pepper = std::fs::read_to_string(&config.api_key_pepper_file)
+        .map(|p| p.trim().to_string())
+        .map_err(|e| anyhow::anyhow!("auth mode is prod but pepper file is missing: {}", e))?;
+    
+    if pepper.is_empty() {
+        bail!("auth mode is prod but pepper file is empty");
+    }
+    
+    let verifier = auth::ApiKeyVerifier::load_from_file(&config.api_keys_file, &pepper)
+        .map_err(|e| anyhow::anyhow!("auth mode is prod but API key file is invalid: {}", e))?;
+    
+    if verifier.is_empty() {
+        bail!("auth mode is prod but no active API keys in key file");
+    }
+    
+    eprintln!("  Loaded {} active API keys", verifier.len());
+    Ok(Some(verifier))
 }
 
 fn cmd_serve(args: &[String]) -> Result<()> {
@@ -340,10 +375,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
         );
     }
 
-    let api_keys = load_api_keys(&config)?;
-    if matches!(config.auth_mode, AuthMode::Prod) && api_keys.is_empty() {
-        bail!("auth mode is prod but no API keys were loaded");
-    }
+    let api_key_verifier = load_api_key_verifier(&config)?;
 
     eprintln!("  Auth mode: {:?}", config.auth_mode);
     eprintln!("  Trusted proxies: {}", config.trusted_proxies.len());
@@ -363,7 +395,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     let state = Arc::new(AppState {
         templates,
         template_statuses,
-        api_keys,
+        api_key_verifier,
         rate_limiters: std::sync::Mutex::new(std::collections::HashMap::new()),
         metrics,
         execution_semaphore: Arc::new(tokio::sync::Semaphore::new(config.limits.max_concurrent_requests)),

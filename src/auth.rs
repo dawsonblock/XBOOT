@@ -50,7 +50,8 @@ impl ApiKeyVerifier {
 
     /// Verify a bearer token against stored records.
     /// Token format: "prefix.secret"
-    pub fn verify(&self, token: &str) -> Result<bool> {
+    /// Returns the key record on success, Err on failure.
+    pub fn verify(&self, token: &str) -> Result<ApiKeyRecord> {
         // Split token into prefix.secret
         let parts: Vec<&str> = token.splitn(2, '.').collect();
         if parts.len() != 2 {
@@ -62,12 +63,12 @@ impl ApiKeyVerifier {
         // Lookup record by prefix
         let record = match self.records.get(prefix) {
             Some(r) => r,
-            None => return Ok(false),
+            None => bail!("key not found"),
         };
         
         // Check if key is disabled
         if record.disabled_at.is_some() {
-            return Ok(false);
+            bail!("key is disabled");
         }
         
         // Compute expected hash: HMAC-SHA256(pepper, prefix:secret)
@@ -77,10 +78,20 @@ impl ApiKeyVerifier {
         
         // Constant-time comparison
         if computed_hash == record.hash {
-            Ok(true)
+            Ok(record.clone())
         } else {
-            Ok(false)
+            bail!("invalid key");
         }
+    }
+    
+    /// Check if verifier has no active keys
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+    
+    /// Get the number of active keys
+    pub fn len(&self) -> usize {
+        self.records.len()
     }
 
     /// Get key info (without sensitive data) for auditing

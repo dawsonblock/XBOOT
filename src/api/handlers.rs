@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::auth;
+
 fn process_memory_usage_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -133,7 +135,7 @@ pub struct Template {
 pub struct AppState {
     pub templates: HashMap<String, Template>,
     pub template_statuses: HashMap<String, TemplateStatus>,
-    pub api_keys: Vec<String>,
+    pub api_key_verifier: Option<auth::ApiKeyVerifier>,
     pub rate_limiters: Mutex<HashMap<String, TokenBucket>>,
     pub metrics: Metrics,
     pub config: ServerConfig,
@@ -261,13 +263,34 @@ fn extract_api_key(headers: &HeaderMap) -> Option<String> {
 }
 
 fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    if state.api_keys.is_empty() {
-        return Ok("anonymous".into());
+    // If no verifier (dev mode or no keys configured), allow anonymous
+    let verifier = match &state.api_key_verifier {
+        Some(v) => v,
+        None => return Ok("anonymous".into()),
+    };
+    
+    // If verifier exists but has no active keys, require auth
+    if verifier.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, Json(ErrorResponse { 
+            error: "No active API keys configured".into(), 
+            request_id: None 
+        })));
     }
+    
     match extract_api_key(headers) {
-        Some(key) if state.api_keys.contains(&key) => Ok(key),
-        Some(_) => Err((StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "Invalid API key".into(), request_id: None }))),
-        None => Err((StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "Missing Authorization header".into(), request_id: None }))),
+        Some(key) => {
+            match verifier.verify(&key) {
+                Ok(record) => Ok(record.id),
+                Err(_) => Err((StatusCode::UNAUTHORIZED, Json(ErrorResponse { 
+                    error: "Invalid API key".into(), 
+                    request_id: None 
+                }))),
+            }
+        },
+        None => Err((StatusCode::UNAUTHORIZED, Json(ErrorResponse { 
+            error: "Missing Authorization header".into(), 
+            request_id: None 
+        }))),
     }
 }
 

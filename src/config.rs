@@ -46,6 +46,7 @@ pub struct ArtifactConfig {
     pub allowed_firecracker_binary_sha256: Option<String>,
     pub release_channel: Option<String>,
     pub require_template_signatures: bool,
+    pub keyring_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +128,7 @@ impl ServerConfig {
                 allowed_firecracker_binary_sha256: env::var("ZEROBOOT_ALLOWED_FC_BINARY_SHA256").ok().filter(|s| !s.trim().is_empty()),
                 release_channel: env::var("ZEROBOOT_RELEASE_CHANNEL").ok().filter(|s| !s.trim().is_empty()),
                 require_template_signatures: bool_env("ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES", auth_mode_prod),
+                keyring_path: env::var("ZEROBOOT_KEYRING_PATH").ok().filter(|s| !s.trim().is_empty()).map(PathBuf::from),
             },
             pool: PoolConfig {
                 min_idle_per_lang: usize_env("ZEROBOOT_POOL_MIN_PER_LANG", 0),
@@ -189,6 +191,7 @@ mod tests {
                 allowed_firecracker_binary_sha256: None,
                 release_channel: None,
                 require_template_signatures: false,
+                keyring_path: None,
             },
             pool: PoolConfig {
                 min_idle_per_lang: 0,
