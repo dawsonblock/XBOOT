@@ -1,8 +1,10 @@
-mod vmm;
 mod api;
+mod auth;
 mod config;
 mod protocol;
+mod signing;
 mod template_manifest;
+mod vmm;
 
 use anyhow::{bail, Result};
 use axum::extract::DefaultBodyLimit;
@@ -12,11 +14,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use api::handlers::{
-    apply_request_log_path_fix, batch_handler, exec_handler, health_handler, live_handler, metrics_handler, ready_handler,
-    AppState, Metrics, Template,
+    apply_request_log_path_fix, batch_handler, exec_handler, health_handler, live_handler,
+    metrics_handler, ready_handler, AppState, Metrics, Template,
 };
 use config::{AuthMode, ServerConfig};
 use protocol::GuestRequest;
+use template_manifest::{verify_template_artifacts, VerificationMode};
 use vmm::firecracker;
 use vmm::kvm::{create_snapshot_memfd, ForkedVm, VmSnapshot};
 use vmm::vmstate;
@@ -29,35 +32,116 @@ fn main() -> Result<()> {
         "bench" | "fork-bench" => cmd_fork_bench(&args[2..]),
         "serve" => cmd_serve(&args[2..]),
         "test-exec" => cmd_test_exec(&args[2..]),
+        "sign" => cmd_sign(&args[2..]),
+        "keygen" => cmd_keygen(&args[2..]),
         _ => {
             eprintln!("Usage: zeroboot <command>");
             eprintln!("  template <kernel> <rootfs> <workdir> [wait_secs] [init_path] [mem_mib]");
             eprintln!("  bench <workdir> [language]");
             eprintln!("  test-exec <workdir> [language] <code>");
             eprintln!("  serve <workdir>[,lang:workdir2,...] [port]");
+            eprintln!("  sign <key> <manifest>");
+            eprintln!("  keygen");
             Ok(())
         }
     }
 }
 
-fn validate_snapshot_workdir(workdir: &str, expected_language: Option<&str>, config: Option<&ServerConfig>) -> Result<()> {
+fn validate_snapshot_workdir(
+    workdir: &str,
+    expected_language: Option<&str>,
+    config: Option<&ServerConfig>,
+) -> Result<()> {
     let workdir_path = Path::new(workdir);
-    let require_hashes = config.map(|cfg| cfg.artifacts.require_template_hashes).unwrap_or(false);
-    let allowed_firecracker_version = config
-        .and_then(|cfg| cfg.artifacts.allowed_firecracker_version.as_deref());
-    template_manifest::verify_template_artifacts(
+    let require_hashes = config
+        .map(|cfg| cfg.artifacts.require_template_hashes)
+        .unwrap_or(false);
+    let allowed_firecracker_version =
+        config.and_then(|cfg| cfg.artifacts.allowed_firecracker_version.as_deref());
+    let allowed_firecracker_binary_sha256 =
+        config.and_then(|cfg| cfg.artifacts.allowed_firecracker_binary_sha256.as_deref());
+    let keyring_path = config
+        .and_then(|cfg| cfg.artifacts.keyring_path.as_ref())
+        .map(|p| p.as_path());
+    let require_signatures = config
+        .map(|cfg| cfg.artifacts.require_template_signatures)
+        .unwrap_or(false);
+    let mode = config
+        .map(|cfg| {
+            if matches!(cfg.auth_mode, AuthMode::Prod) {
+                VerificationMode::Prod
+            } else {
+                VerificationMode::Dev
+            }
+        })
+        .unwrap_or(VerificationMode::Dev);
+    verify_template_artifacts(
         workdir_path,
         expected_language,
         allowed_firecracker_version,
+        allowed_firecracker_binary_sha256,
         require_hashes,
+        require_signatures,
+        mode,
+        keyring_path,
     )?;
     Ok(())
 }
 
-fn load_snapshot(workdir: &str, expected_language: Option<&str>, config: Option<&ServerConfig>) -> Result<(VmSnapshot, i32)> {
-    validate_snapshot_workdir(workdir, expected_language, config)?;
-    let mem_path = format!("{}/snapshot/mem", workdir);
-    let state_path = format!("{}/snapshot/vmstate", workdir);
+fn load_snapshot(
+    workdir: &str,
+    expected_language: Option<&str>,
+    config: Option<&ServerConfig>,
+) -> Result<(VmSnapshot, i32)> {
+    // First validate and get the manifest to know the actual paths
+    let workdir_path = Path::new(workdir);
+    let require_hashes = config
+        .map(|cfg| cfg.artifacts.require_template_hashes)
+        .unwrap_or(false);
+    let allowed_firecracker_version =
+        config.and_then(|cfg| cfg.artifacts.allowed_firecracker_version.as_deref());
+    let allowed_firecracker_binary_sha256 =
+        config.and_then(|cfg| cfg.artifacts.allowed_firecracker_binary_sha256.as_deref());
+    let keyring_path = config
+        .and_then(|cfg| cfg.artifacts.keyring_path.as_ref())
+        .map(|p| p.as_path());
+    let require_signatures = config
+        .map(|cfg| cfg.artifacts.require_template_signatures)
+        .unwrap_or(false);
+    let mode = config
+        .map(|cfg| {
+            if matches!(cfg.auth_mode, AuthMode::Prod) {
+                VerificationMode::Prod
+            } else {
+                VerificationMode::Dev
+            }
+        })
+        .unwrap_or(VerificationMode::Dev);
+
+    let manifest = verify_template_artifacts(
+        workdir_path,
+        expected_language,
+        allowed_firecracker_version,
+        allowed_firecracker_binary_sha256,
+        require_hashes,
+        require_signatures,
+        mode,
+        keyring_path,
+    )?;
+
+    // Use paths from manifest, resolved with confinement in prod mode
+    let (mem_path, state_path) = if mode == VerificationMode::Prod {
+        let mem =
+            template_manifest::resolve_path_confined(workdir_path, &manifest.snapshot_mem_path)?;
+        let state =
+            template_manifest::resolve_path_confined(workdir_path, &manifest.snapshot_state_path)?;
+        (mem, state)
+    } else {
+        (
+            template_manifest::resolve_path(workdir_path, &manifest.snapshot_mem_path),
+            template_manifest::resolve_path(workdir_path, &manifest.snapshot_state_path),
+        )
+    };
 
     eprintln!("Loading snapshot from {}...", workdir);
     let mem_data = std::fs::read(&mem_path)?;
@@ -74,19 +158,25 @@ fn load_snapshot(workdir: &str, expected_language: Option<&str>, config: Option<
         parsed.regs.rip, parsed.regs.rsp, parsed.sregs.cr3
     );
     eprintln!("  MSRs: {} entries", parsed.msrs.len());
-    eprintln!("  CPUID: {} entries from Firecracker snapshot", parsed.cpuid_entries.len());
+    eprintln!(
+        "  CPUID: {} entries from Firecracker snapshot",
+        parsed.cpuid_entries.len()
+    );
 
-    Ok((VmSnapshot {
-        regs: parsed.regs,
-        sregs: parsed.sregs,
-        msrs: parsed.msrs,
-        lapic: parsed.lapic,
-        ioapic_redirtbl: parsed.ioapic_redirtbl,
-        xcrs: parsed.xcrs,
-        xsave: parsed.xsave,
-        cpuid_entries: parsed.cpuid_entries,
-        mem_size,
-    }, memfd))
+    Ok((
+        VmSnapshot {
+            regs: parsed.regs,
+            sregs: parsed.sregs,
+            msrs: parsed.msrs,
+            lapic: parsed.lapic,
+            ioapic_redirtbl: parsed.ioapic_redirtbl,
+            xcrs: parsed.xcrs,
+            xsave: parsed.xsave,
+            cpuid_entries: parsed.cpuid_entries,
+            mem_size,
+        },
+        memfd,
+    ))
 }
 
 fn cmd_template(args: &[String]) -> Result<()> {
@@ -98,8 +188,14 @@ fn cmd_template(args: &[String]) -> Result<()> {
     let workdir = &args[2];
     let wait_secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20);
     let init_path = args.get(4).map(|s| s.as_str()).unwrap_or("/init");
-    let mem_mib: u32 = args.get(5).and_then(|s| s.parse().ok())
-        .or_else(|| std::env::var("ZEROBOOT_MEM_MIB").ok().and_then(|v| v.parse().ok()))
+    let mem_mib: u32 = args
+        .get(5)
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::env::var("ZEROBOOT_MEM_MIB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
         .unwrap_or(512);
 
     std::fs::create_dir_all(workdir)?;
@@ -127,7 +223,11 @@ fn cmd_test_exec(args: &[String]) -> Result<()> {
         bail!("Usage: zeroboot test-exec <workdir> [language] <code>");
     }
     let code = args[code_start..].join(" ");
-    let normalized_language = if matches!(language.as_str(), "node" | "javascript") { "node" } else { "python" };
+    let normalized_language = if matches!(language.as_str(), "node" | "javascript") {
+        "node"
+    } else {
+        "python"
+    };
     let (snapshot, memfd) = load_snapshot(workdir, Some(normalized_language), None)?;
 
     eprintln!("Forking VM...");
@@ -151,13 +251,24 @@ fn cmd_test_exec(args: &[String]) -> Result<()> {
 
     eprintln!("  Exec time: {:.2}ms", exec_time.as_secs_f64() * 1000.0);
     eprintln!("  Total time: {:.2}ms", total_time.as_secs_f64() * 1000.0);
-    println!("=== stdout ===\n{}", String::from_utf8_lossy(&response.stdout));
+    println!(
+        "=== stdout ===\n{}",
+        String::from_utf8_lossy(&response.stdout)
+    );
     if !response.stderr.is_empty() {
-        println!("=== stderr ===\n{}", String::from_utf8_lossy(&response.stderr));
+        println!(
+            "=== stderr ===\n{}",
+            String::from_utf8_lossy(&response.stderr)
+        );
     }
-    println!("exit_code={} error_type={}", response.exit_code, response.error_type);
+    println!(
+        "exit_code={} error_type={}",
+        response.exit_code, response.error_type
+    );
 
-    unsafe { libc::close(memfd); }
+    unsafe {
+        libc::close(memfd);
+    }
     Ok(())
 }
 
@@ -172,28 +283,56 @@ fn cmd_fork_bench(args: &[String]) -> Result<()> {
     } else {
         b"print(1 + 1)".to_vec()
     };
-    let bench_language = if matches!(language, "node" | "javascript") { "node" } else { "python" };
+    let bench_language = if matches!(language, "node" | "javascript") {
+        "node"
+    } else {
+        "python"
+    };
     let (snapshot, memfd) = load_snapshot(workdir, Some(bench_language), None)?;
     let mem_size = snapshot.mem_size;
 
-    eprintln!("
+    eprintln!(
+        "
 === Zeroboot Fork Benchmark ===
-");
+"
+    );
 
     let mut mmap_times: Vec<f64> = Vec::with_capacity(10_000);
     for _ in 0..100 {
         let p = unsafe {
-            libc::mmap(ptr::null_mut(), mem_size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_NORESERVE, memfd, 0)
+            libc::mmap(
+                ptr::null_mut(),
+                mem_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                memfd,
+                0,
+            )
         };
-        if p != libc::MAP_FAILED { unsafe { libc::munmap(p, mem_size); } }
+        if p != libc::MAP_FAILED {
+            unsafe {
+                libc::munmap(p, mem_size);
+            }
+        }
     }
     for _ in 0..10_000 {
         let start = Instant::now();
         let p = unsafe {
-            libc::mmap(ptr::null_mut(), mem_size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_NORESERVE, memfd, 0)
+            libc::mmap(
+                ptr::null_mut(),
+                mem_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                memfd,
+                0,
+            )
         };
         mmap_times.push(start.elapsed().as_secs_f64() * 1_000_000.0);
-        if p != libc::MAP_FAILED { unsafe { libc::munmap(p, mem_size); } }
+        if p != libc::MAP_FAILED {
+            unsafe {
+                libc::munmap(p, mem_size);
+            }
+        }
     }
     mmap_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     print_percentiles("Pure mmap CoW", &mmap_times);
@@ -214,7 +353,10 @@ fn cmd_fork_bench(args: &[String]) -> Result<()> {
     print_percentiles("Full fork (KVM + CoW + CPU restore)", &fork_times);
 
     eprintln!();
-    eprintln!("Phase 3: Fork + framed {} request (100 iterations)...", bench_language);
+    eprintln!(
+        "Phase 3: Fork + framed {} request (100 iterations)...",
+        bench_language
+    );
     let mut request_times: Vec<f64> = Vec::with_capacity(100);
     let mut success_count = 0;
     for _ in 0..100 {
@@ -237,7 +379,10 @@ fn cmd_fork_bench(args: &[String]) -> Result<()> {
         drop(vm);
     }
     request_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    println!("  Fork + framed {} request ({}/100 successful):", bench_language, success_count);
+    println!(
+        "  Fork + framed {} request ({}/100 successful):",
+        bench_language, success_count
+    );
     if !request_times.is_empty() {
         let n = request_times.len();
         println!("    P50:  {:>8.3} ms", request_times[n / 2]);
@@ -245,21 +390,56 @@ fn cmd_fork_bench(args: &[String]) -> Result<()> {
         println!("    P99:  {:>8.3} ms", request_times[n * 99 / 100]);
     }
 
-    unsafe { libc::close(memfd); }
+    unsafe {
+        libc::close(memfd);
+    }
     Ok(())
 }
 
-fn load_api_keys(config: &ServerConfig) -> Result<Vec<String>> {
-    match std::fs::read_to_string(&config.api_keys_file) {
-        Ok(data) => Ok(serde_json::from_str::<Vec<String>>(&data).unwrap_or_default()),
-        Err(e) => match config.auth_mode {
-            AuthMode::Dev => {
-                eprintln!("  Dev auth mode: no API keys file at {}, continuing with auth disabled", config.api_keys_file.display());
-                Ok(Vec::new())
+fn load_api_key_verifier(config: &ServerConfig) -> Result<Option<auth::ApiKeyVerifier>> {
+    // In dev mode, allow no keys
+    if matches!(config.auth_mode, AuthMode::Dev) {
+        // Try to load if file exists, but don't fail if missing
+        if let Ok(pepper) = std::fs::read_to_string(&config.api_key_pepper_file) {
+            let pepper = pepper.trim();
+            if !pepper.is_empty() {
+                match auth::ApiKeyVerifier::load_from_file(&config.api_keys_file, pepper) {
+                    Ok(verifier) => {
+                        eprintln!(
+                            "  Loaded {} API keys from {}",
+                            verifier.len(),
+                            config.api_keys_file.display()
+                        );
+                        return Ok(Some(verifier));
+                    }
+                    Err(e) => {
+                        eprintln!("  Dev mode: could not load API keys ({}), continuing with auth disabled", e);
+                    }
+                }
             }
-            AuthMode::Prod => bail!("auth mode is prod but API keys file is missing or unreadable: {}", e),
-        },
+        }
+        eprintln!("  Dev auth mode: no pepper or keys configured, continuing with auth disabled");
+        return Ok(None);
     }
+
+    // In prod mode, require both pepper and keys
+    let pepper = std::fs::read_to_string(&config.api_key_pepper_file)
+        .map(|p| p.trim().to_string())
+        .map_err(|e| anyhow::anyhow!("auth mode is prod but pepper file is missing: {}", e))?;
+
+    if pepper.is_empty() {
+        bail!("auth mode is prod but pepper file is empty");
+    }
+
+    let verifier = auth::ApiKeyVerifier::load_from_file(&config.api_keys_file, &pepper)
+        .map_err(|e| anyhow::anyhow!("auth mode is prod but API key file is invalid: {}", e))?;
+
+    if verifier.is_empty() {
+        bail!("auth mode is prod but no active API keys in key file");
+    }
+
+    eprintln!("  Loaded {} active API keys", verifier.len());
+    Ok(Some(verifier))
 }
 
 fn cmd_serve(args: &[String]) -> Result<()> {
@@ -283,29 +463,60 @@ fn cmd_serve(args: &[String]) -> Result<()> {
             Ok(()) => {
                 let (snapshot, memfd) = load_snapshot(&dir, Some(&lang), Some(&config))?;
                 eprintln!("  Template '{}' loaded from {}", lang, dir);
-                templates.insert(lang.clone(), Template { snapshot, memfd, workdir: dir.clone() });
-                template_statuses.insert(lang, api::handlers::TemplateStatus { ready: true, detail: "startup verification ok".into() });
+                templates.insert(
+                    lang.clone(),
+                    Template {
+                        snapshot,
+                        memfd,
+                        workdir: dir.clone(),
+                    },
+                );
+                template_statuses.insert(
+                    lang,
+                    api::handlers::TemplateStatus {
+                        ready: true,
+                        detail: "startup verification ok".into(),
+                    },
+                );
             }
             Err(e) => {
                 quarantined += 1;
                 eprintln!("  Template '{}' quarantined: {}", lang, e);
-                template_statuses.insert(lang, api::handlers::TemplateStatus { ready: false, detail: format!("quarantined: {}", e) });
+                template_statuses.insert(
+                    lang,
+                    api::handlers::TemplateStatus {
+                        ready: false,
+                        detail: format!("quarantined: {}", e),
+                    },
+                );
             }
         }
     }
 
-    let api_keys = load_api_keys(&config)?;
-    if matches!(config.auth_mode, AuthMode::Prod) && api_keys.is_empty() {
-        bail!("auth mode is prod but no API keys were loaded");
+    // In Prod mode, fail hard if any template is quarantined - no partial activation
+    if matches!(config.auth_mode, AuthMode::Prod) && quarantined > 0 {
+        bail!(
+            "prod mode requires all templates to be valid, but {} template(s) quarantined",
+            quarantined
+        );
     }
+
+    let api_key_verifier = load_api_key_verifier(&config)?;
 
     eprintln!("  Auth mode: {:?}", config.auth_mode);
     eprintln!("  Trusted proxies: {}", config.trusted_proxies.len());
-    eprintln!("  Request log path: {} (log_code={})", config.logging.path.display(), config.logging.log_code);
+    eprintln!(
+        "  Request log path: {} (log_code={})",
+        config.logging.path.display(),
+        config.logging.log_code
+    );
     eprintln!("  Bind address: {}", config.bind_addr);
     eprintln!("  Queue wait timeout: {} ms", config.queue.wait_timeout_ms);
     eprintln!("  Health cache TTL: {} s", config.health.cache_ttl_secs);
-    eprintln!("  Require template hashes: {}", config.artifacts.require_template_hashes);
+    eprintln!(
+        "  Require template hashes: {}",
+        config.artifacts.require_template_hashes
+    );
     if let Some(version) = &config.artifacts.allowed_firecracker_version {
         eprintln!("  Allowed Firecracker version: {}", version);
     }
@@ -313,14 +524,18 @@ fn cmd_serve(args: &[String]) -> Result<()> {
 
     let (request_log_tx, mut request_log_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let metrics = Metrics::new();
-    metrics.template_quarantines.store(quarantined, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .template_quarantines
+        .store(quarantined, std::sync::atomic::Ordering::Relaxed);
     let state = Arc::new(AppState {
         templates,
         template_statuses,
-        api_keys,
+        api_key_verifier,
         rate_limiters: std::sync::Mutex::new(std::collections::HashMap::new()),
         metrics,
-        execution_semaphore: Arc::new(tokio::sync::Semaphore::new(config.limits.max_concurrent_requests)),
+        execution_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.limits.max_concurrent_requests,
+        )),
         request_log_tx,
         health_cache: std::sync::Mutex::new(None),
         config: config.clone(),
@@ -378,10 +593,13 @@ fn cmd_serve(args: &[String]) -> Result<()> {
         let bind_target = format!("{}:{}", bind_addr, port);
         let listener = tokio::net::TcpListener::bind(&bind_target).await.unwrap();
         eprintln!("Zeroboot API server listening on {}", bind_target);
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
         eprintln!("Server shutdown complete");
     });
     Ok(())
@@ -395,10 +613,108 @@ async fn shutdown_signal() {
 fn print_percentiles(label: &str, times: &[f64]) {
     let n = times.len();
     println!("  {} ({} iterations):", label, n);
-    println!("    Min:  {:>8.1} µs ({:.3} ms)", times[0], times[0] / 1000.0);
-    println!("    Avg:  {:>8.1} µs ({:.3} ms)", times.iter().sum::<f64>() / n as f64, times.iter().sum::<f64>() / n as f64 / 1000.0);
-    println!("    P50:  {:>8.1} µs ({:.3} ms)", times[n / 2], times[n / 2] / 1000.0);
-    println!("    P95:  {:>8.1} µs ({:.3} ms)", times[n * 95 / 100], times[n * 95 / 100] / 1000.0);
-    println!("    P99:  {:>8.1} µs ({:.3} ms)", times[n * 99 / 100], times[n * 99 / 100] / 1000.0);
-    println!("    Max:  {:>8.1} µs ({:.3} ms)", times[n - 1], times[n - 1] / 1000.0);
+    println!(
+        "    Min:  {:>8.1} µs ({:.3} ms)",
+        times[0],
+        times[0] / 1000.0
+    );
+    println!(
+        "    Avg:  {:>8.1} µs ({:.3} ms)",
+        times.iter().sum::<f64>() / n as f64,
+        times.iter().sum::<f64>() / n as f64 / 1000.0
+    );
+    println!(
+        "    P50:  {:>8.1} µs ({:.3} ms)",
+        times[n / 2],
+        times[n / 2] / 1000.0
+    );
+    println!(
+        "    P95:  {:>8.1} µs ({:.3} ms)",
+        times[n * 95 / 100],
+        times[n * 95 / 100] / 1000.0
+    );
+    println!(
+        "    P99:  {:>8.1} µs ({:.3} ms)",
+        times[n * 99 / 100],
+        times[n * 99 / 100] / 1000.0
+    );
+    println!(
+        "    Max:  {:>8.1} µs ({:.3} ms)",
+        times[n - 1],
+        times[n - 1] / 1000.0
+    );
+}
+
+fn cmd_keygen(args: &[String]) -> Result<()> {
+    use std::io::Write;
+
+    let (pkcs8, public_key) = signing::generate_key_pair()?;
+    let key_id = signing::get_key_id(&public_key);
+
+    println!("Key ID: {}", key_id);
+    println!("Public Key (base64):");
+    println!("  {}", signing::format_public_key_base64(&public_key));
+
+    // Write private key to file
+    let key_path_str = args.first().map(|s| s.as_str()).unwrap_or("key.pkcs8");
+    let key_path = Path::new(key_path_str);
+    let mut file = std::fs::File::create(key_path)?;
+    file.write_all(&pkcs8)?;
+
+    println!("Private key written to: {}", key_path.display());
+    println!();
+    println!("To add to keyring, add this to your keyring.json:");
+    println!("{{");
+    println!("  \"id\": \"{}\",", key_id);
+    println!("  \"algorithm\": \"ed25519\",");
+    println!(
+        "  \"public_key\": \"{}\",",
+        signing::format_public_key_base64(&public_key)
+    );
+    println!("  \"enabled\": true,");
+    println!("  \"description\": \"production signing key\"");
+    println!("}}");
+
+    Ok(())
+}
+
+fn cmd_sign(args: &[String]) -> Result<()> {
+    if args.len() < 2 {
+        bail!("Usage: zeroboot sign <key_path> <manifest_path>");
+    }
+
+    let key_path = Path::new(&args[0]);
+    let manifest_path = Path::new(&args[1]);
+
+    let key_bytes = std::fs::read(key_path)?;
+    let manifest_json = std::fs::read_to_string(manifest_path)?;
+
+    // Sign the core identity fields
+    let signed_fields = [
+        "template_id",
+        "build_id",
+        "artifact_set_id",
+        "promotion_channel",
+    ];
+    let (signature, _) = signing::sign_manifest(&key_bytes, &manifest_json, &signed_fields)?;
+
+    // Get key ID
+    let public_key = signing::export_public_key(&key_bytes)?;
+    let key_id = signing::get_key_id(&public_key);
+
+    // Update manifest with signature
+    let mut manifest: serde_json::Value = serde_json::from_str(&manifest_json)?;
+    manifest["signer_key_id"] = serde_json::json!(key_id);
+    manifest["manifest_signature"] = serde_json::json!(signature);
+    manifest["manifest_signed_fields"] = serde_json::json!(signed_fields);
+
+    // Write signed manifest
+    let signed_json = serde_json::to_string_pretty(&manifest)?;
+    std::fs::write(manifest_path, signed_json)?;
+
+    println!("Manifest signed with key ID: {}", key_id);
+    println!("Signature: {}", signature);
+    println!("Signed fields: {:?}", signed_fields);
+
+    Ok(())
 }

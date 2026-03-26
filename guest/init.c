@@ -7,11 +7,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+// Protocol version - must match server
+#define PROTOCOL_VERSION "ZB1"
+
+// Size limits
 #define SERIAL_DEV "/dev/ttyS0"
 #define HEADER_BUF 512
 #define MAX_REQUEST_ID 128
@@ -417,6 +422,30 @@ static int handle_request_frame(void) {
 }
 
 int main(void) {
+    // Apply resource limits for security
+    struct rlimit limits;
+    
+    // Limit number of open files
+    limits.rlim_cur = 256;
+    limits.rlim_max = 256;
+    setrlimit(RLIMIT_NOFILE, &limits);
+    
+    // Limit number of processes (prevents fork bombs)
+    limits.rlim_cur = 32;
+    limits.rlim_max = 32;
+    setrlimit(RLIMIT_NPROC, &limits);
+    
+    // Limit file size (prevents massive output files)
+    limits.rlim_cur = 8 * 1024 * 1024; // 8MB
+    limits.rlim_max = 8 * 1024 * 1024;
+    setrlimit(RLIMIT_FSIZE, &limits);
+    
+    // Disable core dumps
+    limits.rlim_cur = 0;
+    limits.rlim_max = 0;
+    setrlimit(RLIMIT_CORE, &limits);
+    
+    // Setup filesystems
     mkdir("/proc", 0755);
     mkdir("/sys", 0755);
     mkdir("/dev", 0755);
@@ -436,8 +465,11 @@ int main(void) {
 
     {
         char ready_line[128];
-        snprintf(ready_line, sizeof(ready_line), "ZEROBOOT_READY python=%d node=%d\n", python_worker.available, node_worker.available);
+        // Include protocol version in ready line for server validation
+        snprintf(ready_line, sizeof(ready_line), "ZEROBOOT_READY proto=%s worker_python=%d worker_node=%d\n", 
+                 PROTOCOL_VERSION, python_worker.available, node_worker.available);
         serial_puts(ready_line);
+        fflush(stdout);
     }
 
     while (1) {

@@ -9,13 +9,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::auth;
+
 fn process_memory_usage_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        let page_size = if page_size > 0 { page_size as u64 } else { 4096 };
+        let page_size = if page_size > 0 {
+            page_size as u64
+        } else {
+            4096
+        };
         if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
-            if let Some(rss_pages) = statm.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()) {
+            if let Some(rss_pages) = statm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok())
+            {
                 return rss_pages.saturating_mul(page_size);
             }
         }
@@ -39,8 +49,12 @@ pub struct ExecRequest {
     pub stdin: String,
 }
 
-fn default_language() -> String { "python".to_string() }
-fn default_timeout() -> u64 { 30 }
+fn default_language() -> String {
+    "python".to_string()
+}
+fn default_timeout() -> u64 {
+    30
+}
 
 #[derive(Serialize, Clone)]
 pub struct ExecResponse {
@@ -96,7 +110,12 @@ pub struct TokenBucket {
 
 impl TokenBucket {
     fn with_capacity(rate: f64, capacity: f64) -> Self {
-        Self { tokens: capacity, last_refill: Instant::now(), rate, capacity }
+        Self {
+            tokens: capacity,
+            last_refill: Instant::now(),
+            rate,
+            capacity,
+        }
     }
 
     fn refill(&mut self) {
@@ -133,7 +152,7 @@ pub struct Template {
 pub struct AppState {
     pub templates: HashMap<String, Template>,
     pub template_statuses: HashMap<String, TemplateStatus>,
-    pub api_keys: Vec<String>,
+    pub api_key_verifier: Option<auth::ApiKeyVerifier>,
     pub rate_limiters: Mutex<HashMap<String, TokenBucket>>,
     pub metrics: Metrics,
     pub config: ServerConfig,
@@ -148,7 +167,9 @@ pub struct CachedHealthState {
     pub response: HealthResponse,
 }
 
-const HISTOGRAM_BUCKETS_MS: &[f64] = &[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
+const HISTOGRAM_BUCKETS_MS: &[f64] = &[
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0,
+];
 const NUM_BUCKETS: usize = 13;
 
 pub struct Histogram {
@@ -167,9 +188,13 @@ impl Histogram {
     }
 
     fn observe(&self, value_ms: f64) {
-        let slot = HISTOGRAM_BUCKETS_MS.iter().position(|&bound| value_ms <= bound).unwrap_or(NUM_BUCKETS);
+        let slot = HISTOGRAM_BUCKETS_MS
+            .iter()
+            .position(|&bound| value_ms <= bound)
+            .unwrap_or(NUM_BUCKETS);
         self.buckets[slot].fetch_add(1, Ordering::Relaxed);
-        self.sum_us.fetch_add((value_ms * 1000.0) as u64, Ordering::Relaxed);
+        self.sum_us
+            .fetch_add((value_ms * 1000.0) as u64, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -178,18 +203,35 @@ impl Histogram {
         let mut cumulative = 0u64;
         for (i, &bound) in HISTOGRAM_BUCKETS_MS.iter().enumerate() {
             cumulative += self.buckets[i].load(Ordering::Relaxed);
-            out.push_str(&format!("{}_bucket{{le=\"{}\"}} {}\n", name, format_bucket(bound), cumulative));
+            out.push_str(&format!(
+                "{}_bucket{{le=\"{}\"}} {}\n",
+                name,
+                format_bucket(bound),
+                cumulative
+            ));
         }
         cumulative += self.buckets[NUM_BUCKETS].load(Ordering::Relaxed);
         out.push_str(&format!("{}_bucket{{le=\"+Inf\"}} {}\n", name, cumulative));
-        out.push_str(&format!("{}_sum {}\n", name, self.sum_us.load(Ordering::Relaxed) as f64 / 1000.0));
-        out.push_str(&format!("{}_count {}\n", name, self.count.load(Ordering::Relaxed)));
+        out.push_str(&format!(
+            "{}_sum {}\n",
+            name,
+            self.sum_us.load(Ordering::Relaxed) as f64 / 1000.0
+        ));
+        out.push_str(&format!(
+            "{}_count {}\n",
+            name,
+            self.count.load(Ordering::Relaxed)
+        ));
         out
     }
 }
 
 fn format_bucket(v: f64) -> String {
-    if v == v.floor() { format!("{}", v as u64) } else { format!("{}", v) }
+    if v == v.floor() {
+        format!("{}", v as u64)
+    } else {
+        format!("{}", v)
+    }
 }
 
 #[derive(Default, Clone)]
@@ -254,40 +296,85 @@ impl Metrics {
 }
 
 fn extract_api_key(headers: &HeaderMap) -> Option<String> {
-    headers.get("authorization")
+    headers
+        .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|s| s.to_string())
 }
 
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    if state.api_keys.is_empty() {
-        return Ok("anonymous".into());
+fn check_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    // If no verifier (dev mode or no keys configured), allow anonymous
+    let verifier = match &state.api_key_verifier {
+        Some(v) => v,
+        None => return Ok("anonymous".into()),
+    };
+
+    // If verifier exists but has no active keys, require auth
+    if verifier.is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "No active API keys configured".into(),
+                request_id: None,
+            }),
+        ));
     }
+
     match extract_api_key(headers) {
-        Some(key) if state.api_keys.contains(&key) => Ok(key),
-        Some(_) => Err((StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "Invalid API key".into(), request_id: None }))),
-        None => Err((StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "Missing Authorization header".into(), request_id: None }))),
+        Some(key) => match verifier.verify(&key) {
+            Ok(record) => Ok(record.id),
+            Err(_) => Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Invalid API key".into(),
+                    request_id: None,
+                }),
+            )),
+        },
+        None => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Missing Authorization header".into(),
+                request_id: None,
+            }),
+        )),
     }
 }
 
 fn extract_client_ip(state: &AppState, headers: &HeaderMap, addr: SocketAddr) -> String {
     if state.config.is_trusted_proxy(addr.ip()) {
-        if let Some(v) = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()) {
+        if let Some(v) = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+        {
             let ip = v.trim();
-            if !ip.is_empty() { return ip.to_string(); }
+            if !ip.is_empty() {
+                return ip.to_string();
+            }
         }
         if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             if let Some(first) = v.split(',').next() {
                 let ip = first.trim();
-                if !ip.is_empty() { return ip.to_string(); }
+                if !ip.is_empty() {
+                    return ip.to_string();
+                }
             }
         }
     }
     addr.ip().to_string()
 }
 
-fn check_rate_limit(state: &AppState, tenant_key: &str, headers: &HeaderMap, addr: SocketAddr, cost: usize) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+fn check_rate_limit(
+    state: &AppState,
+    tenant_key: &str,
+    headers: &HeaderMap,
+    addr: SocketAddr,
+    cost: usize,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let is_demo = tenant_key.starts_with("zb_demo_");
     let client_ip = extract_client_ip(state, headers, addr);
     let bucket_key = if is_demo {
@@ -295,23 +382,38 @@ fn check_rate_limit(state: &AppState, tenant_key: &str, headers: &HeaderMap, add
     } else {
         format!("tenant:{}", tenant_key)
     };
-    let (rate, capacity) = if is_demo { (10.0 / 60.0, 10.0) } else { (100.0, 100.0) };
+    let (rate, capacity) = if is_demo {
+        (10.0 / 60.0, 10.0)
+    } else {
+        (100.0, 100.0)
+    };
     let mut limiters = state.rate_limiters.lock().unwrap();
-    let bucket = limiters.entry(bucket_key).or_insert_with(|| TokenBucket::with_capacity(rate, capacity));
+    let bucket = limiters
+        .entry(bucket_key)
+        .or_insert_with(|| TokenBucket::with_capacity(rate, capacity));
     if bucket.try_consume_n(cost.max(1)) {
         Ok(())
     } else {
-        Err((StatusCode::TOO_MANY_REQUESTS, Json(ErrorResponse {
-            error: if is_demo { "Rate limit exceeded (10 req/min per demo tenant)".into() } else { "Rate limit exceeded".into() },
-            request_id: None,
-        })))
+        Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse {
+                error: if is_demo {
+                    "Rate limit exceeded (10 req/min per demo tenant)".into()
+                } else {
+                    "Rate limit exceeded".into()
+                },
+                request_id: None,
+            }),
+        ))
     }
 }
 
 const REQUEST_LOG_DEFAULT_CODE_REDACTION: &str = "[redacted]";
 
 fn iso_now() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
     let secs = d.as_secs();
     let millis = d.subsec_millis();
     let days = secs / 86400;
@@ -329,10 +431,20 @@ fn iso_now() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mo <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", y, mo, d, h, m, s, millis)
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y, mo, d, h, m, s, millis
+    )
 }
 
-fn log_request(state: &AppState, request_id: &str, client_ip: &str, api_key_masked: &str, req: &ExecRequest, response: &ExecResponse) {
+fn log_request(
+    state: &AppState,
+    request_id: &str,
+    client_ip: &str,
+    api_key_masked: &str,
+    req: &ExecRequest,
+    response: &ExecResponse,
+) {
     let code_value = if state.config.logging.log_code {
         serde_json::Value::String(req.code.chars().take(1000).collect())
     } else {
@@ -358,7 +470,9 @@ fn log_request(state: &AppState, request_id: &str, client_ip: &str, api_key_mask
     let _ = state.request_log_tx.send(line.to_string());
 }
 
-fn round2(v: f64) -> f64 { (v * 100.0).round() / 100.0 }
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
 
 #[derive(Clone, Copy)]
 enum ExecutionMode {
@@ -366,7 +480,14 @@ enum ExecutionMode {
     Probe,
 }
 
-fn error_response(request_id: &str, stderr: String, kind: &str, total_start: Instant, fork_time_ms: f64, exec_time_ms: f64) -> ExecResponse {
+fn error_response(
+    request_id: &str,
+    stderr: String,
+    kind: &str,
+    total_start: Instant,
+    fork_time_ms: f64,
+    exec_time_ms: f64,
+) -> ExecResponse {
     ExecResponse {
         id: request_id.to_string(),
         stdout: String::new(),
@@ -396,23 +517,63 @@ fn normalize_language(language: &str) -> String {
     }
 }
 
-fn execute_code_internal(state: &AppState, req: &ExecRequest, request_id: &str, mode: ExecutionMode) -> ExecResponse {
+fn execute_code_internal(
+    state: &AppState,
+    req: &ExecRequest,
+    request_id: &str,
+    mode: ExecutionMode,
+) -> ExecResponse {
     let total_start = Instant::now();
-    state.metrics.concurrent_forks.fetch_add(1, Ordering::Relaxed);
+    state
+        .metrics
+        .concurrent_forks
+        .fetch_add(1, Ordering::Relaxed);
     let res = (|| -> ExecResponse {
         let lang = normalize_language(&req.language);
         let limits = &state.config.limits;
         if req.code.len() > limits.max_code_bytes {
             state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
-            return error_response(request_id, format!("Code too large: {} bytes > {} bytes", req.code.len(), limits.max_code_bytes), "validation", total_start, 0.0, 0.0);
+            return error_response(
+                request_id,
+                format!(
+                    "Code too large: {} bytes > {} bytes",
+                    req.code.len(),
+                    limits.max_code_bytes
+                ),
+                "validation",
+                total_start,
+                0.0,
+                0.0,
+            );
         }
         if req.stdin.len() > limits.max_stdin_bytes {
             state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
-            return error_response(request_id, format!("stdin too large: {} bytes > {} bytes", req.stdin.len(), limits.max_stdin_bytes), "validation", total_start, 0.0, 0.0);
+            return error_response(
+                request_id,
+                format!(
+                    "stdin too large: {} bytes > {} bytes",
+                    req.stdin.len(),
+                    limits.max_stdin_bytes
+                ),
+                "validation",
+                total_start,
+                0.0,
+                0.0,
+            );
         }
         if req.timeout_seconds == 0 || req.timeout_seconds > limits.max_timeout_secs {
             state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
-            return error_response(request_id, format!("timeout_seconds must be between 1 and {}", limits.max_timeout_secs), "validation", total_start, 0.0, 0.0);
+            return error_response(
+                request_id,
+                format!(
+                    "timeout_seconds must be between 1 and {}",
+                    limits.max_timeout_secs
+                ),
+                "validation",
+                total_start,
+                0.0,
+                0.0,
+            );
         }
         let template = match state.templates.get(&lang) {
             Some(t) => t,
@@ -431,12 +592,25 @@ fn execute_code_internal(state: &AppState, req: &ExecRequest, request_id: &str, 
             Ok(vm) => vm,
             Err(e) => {
                 state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
-                return error_response(request_id, format!("Fork failed: {}", e), "fork", total_start, 0.0, 0.0);
+                return error_response(
+                    request_id,
+                    format!("Fork failed: {}", e),
+                    "fork",
+                    total_start,
+                    0.0,
+                    0.0,
+                );
             }
         };
         let fork_time_ms = round2(vm.fork_time_us / 1000.0);
-        state.metrics.fork_time_sum_us.fetch_add(vm.fork_time_us as u64, Ordering::Relaxed);
-        state.metrics.fork_time_hist.observe(vm.fork_time_us / 1000.0);
+        state
+            .metrics
+            .fork_time_sum_us
+            .fetch_add(vm.fork_time_us as u64, Ordering::Relaxed);
+        state
+            .metrics
+            .fork_time_hist
+            .observe(vm.fork_time_us / 1000.0);
 
         let request_frame = encode_request_frame(&GuestRequest {
             request_id: request_id.to_string(),
@@ -448,7 +622,14 @@ fn execute_code_internal(state: &AppState, req: &ExecRequest, request_id: &str, 
 
         if let Err(e) = vm.send_serial(&request_frame) {
             state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
-            return error_response(request_id, format!("Send failed: {}", e), "transport", total_start, fork_time_ms, 0.0);
+            return error_response(
+                request_id,
+                format!("Send failed: {}", e),
+                "transport",
+                total_start,
+                fork_time_ms,
+                0.0,
+            );
         }
 
         let exec_start = Instant::now();
@@ -460,36 +641,81 @@ fn execute_code_internal(state: &AppState, req: &ExecRequest, request_id: &str, 
                 if msg.contains("timed out") {
                     state.metrics.total_timeouts.fetch_add(1, Ordering::Relaxed);
                     state.metrics.record_language_outcome(&lang, "timeout");
-                    return error_response(request_id, format!("Execution timed out after {}s", req.timeout_seconds), "timeout", total_start, fork_time_ms, round2(exec_start.elapsed().as_secs_f64() * 1000.0));
+                    return error_response(
+                        request_id,
+                        format!("Execution timed out after {}s", req.timeout_seconds),
+                        "timeout",
+                        total_start,
+                        fork_time_ms,
+                        round2(exec_start.elapsed().as_secs_f64() * 1000.0),
+                    );
                 }
                 state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
-                state.metrics.protocol_errors.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .protocol_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 state.metrics.record_language_outcome(&lang, "error");
-                return error_response(request_id, format!("Protocol failure: {}", msg), "protocol", total_start, fork_time_ms, round2(exec_start.elapsed().as_secs_f64() * 1000.0));
+                return error_response(
+                    request_id,
+                    format!("Protocol failure: {}", msg),
+                    "protocol",
+                    total_start,
+                    fork_time_ms,
+                    round2(exec_start.elapsed().as_secs_f64() * 1000.0),
+                );
             }
         };
 
         let exec_time_ms = round2(exec_start.elapsed().as_secs_f64() * 1000.0);
-        state.metrics.exec_time_sum_us.fetch_add((exec_start.elapsed().as_secs_f64() * 1_000_000.0) as u64, Ordering::Relaxed);
-        state.metrics.exec_time_hist.observe(exec_start.elapsed().as_secs_f64() * 1000.0);
+        state.metrics.exec_time_sum_us.fetch_add(
+            (exec_start.elapsed().as_secs_f64() * 1_000_000.0) as u64,
+            Ordering::Relaxed,
+        );
+        state
+            .metrics
+            .exec_time_hist
+            .observe(exec_start.elapsed().as_secs_f64() * 1000.0);
         if matches!(mode, ExecutionMode::User) {
-            state.metrics.total_executions.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .total_executions
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         if guest_response.request_id != request_id {
             state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
-            state.metrics.protocol_errors.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .protocol_errors
+                .fetch_add(1, Ordering::Relaxed);
             state.metrics.record_language_outcome(&lang, "error");
-            return error_response(request_id, format!("Mismatched response id: got {}, expected {}", guest_response.request_id, request_id), "protocol", total_start, fork_time_ms, exec_time_ms);
+            return error_response(
+                request_id,
+                format!(
+                    "Mismatched response id: got {}, expected {}",
+                    guest_response.request_id, request_id
+                ),
+                "protocol",
+                total_start,
+                fork_time_ms,
+                exec_time_ms,
+            );
         }
 
-        let (mut stdout, stdout_truncated_a) = truncate_bytes(guest_response.stdout, limits.max_stdout_bytes);
-        let (mut stderr, stderr_truncated_a) = truncate_bytes(guest_response.stderr, limits.max_stderr_bytes);
+        let (mut stdout, stdout_truncated_a) =
+            truncate_bytes(guest_response.stdout, limits.max_stdout_bytes);
+        let (mut stderr, stderr_truncated_a) =
+            truncate_bytes(guest_response.stderr, limits.max_stderr_bytes);
         let mut stdout_truncated = stdout_truncated_a || guest_response.stdout_truncated;
         let mut stderr_truncated = stderr_truncated_a || guest_response.stderr_truncated;
         if stdout.len() + stderr.len() > limits.max_total_output_bytes {
-            let available_stderr = limits.max_total_output_bytes.saturating_sub(stdout.len().min(limits.max_total_output_bytes));
-            let available_stdout = limits.max_total_output_bytes.saturating_sub(stderr.len().min(limits.max_total_output_bytes));
+            let available_stderr = limits
+                .max_total_output_bytes
+                .saturating_sub(stdout.len().min(limits.max_total_output_bytes));
+            let available_stdout = limits
+                .max_total_output_bytes
+                .saturating_sub(stderr.len().min(limits.max_total_output_bytes));
             if stdout.len() > available_stdout {
                 stdout.truncate(available_stdout);
                 stdout_truncated = true;
@@ -500,13 +726,23 @@ fn execute_code_internal(state: &AppState, req: &ExecRequest, request_id: &str, 
             }
         }
         if stdout_truncated || stderr_truncated {
-            state.metrics.output_truncations.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .output_truncations
+                .fetch_add(1, Ordering::Relaxed);
         }
         if guest_response.recycle_requested {
-            state.metrics.worker_recycles.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .worker_recycles
+                .fetch_add(1, Ordering::Relaxed);
         }
 
-        let runtime_error_type = if guest_response.error_type.is_empty() { "ok".to_string() } else { guest_response.error_type.clone() };
+        let runtime_error_type = if guest_response.error_type.is_empty() {
+            "ok".to_string()
+        } else {
+            guest_response.error_type.clone()
+        };
         if guest_response.exit_code == 0 && runtime_error_type == "ok" {
             state.metrics.record_language_outcome(&lang, "ok");
         } else if runtime_error_type == "timeout" {
@@ -533,31 +769,57 @@ fn execute_code_internal(state: &AppState, req: &ExecRequest, request_id: &str, 
     if matches!(mode, ExecutionMode::User) {
         state.metrics.total_time_hist.observe(res.total_time_ms);
     }
-    state.metrics.concurrent_forks.fetch_sub(1, Ordering::Relaxed);
+    state
+        .metrics
+        .concurrent_forks
+        .fetch_sub(1, Ordering::Relaxed);
     res
 }
 
 fn probe_template(state: &AppState, language: &str) -> ExecResponse {
     let req = ExecRequest {
-        code: if language == "node" { "console.log(\"ok\")".into() } else { "print(\"ok\")".into() },
+        code: if language == "node" {
+            "console.log(\"ok\")".into()
+        } else {
+            "print(\"ok\")".into()
+        },
         language: language.to_string(),
         timeout_seconds: state.config.health.probe_timeout_secs.max(1),
         stdin: String::new(),
     };
-    execute_code_internal(state, &req, &format!("health-{}", language), ExecutionMode::Probe)
+    execute_code_internal(
+        state,
+        &req,
+        &format!("health-{}", language),
+        ExecutionMode::Probe,
+    )
 }
 
-async fn acquire_permit(state: &Arc<AppState>) -> Result<OwnedSemaphorePermit, (StatusCode, Json<ErrorResponse>)> {
+async fn acquire_permit(
+    state: &Arc<AppState>,
+) -> Result<OwnedSemaphorePermit, (StatusCode, Json<ErrorResponse>)> {
     let wait_start = Instant::now();
     let timeout = Duration::from_millis(state.config.queue.wait_timeout_ms.max(1));
     match tokio::time::timeout(timeout, state.execution_semaphore.clone().acquire_owned()).await {
         Ok(Ok(permit)) => {
-            state.metrics.queue_wait_time_hist.observe(wait_start.elapsed().as_secs_f64() * 1000.0);
+            state
+                .metrics
+                .queue_wait_time_hist
+                .observe(wait_start.elapsed().as_secs_f64() * 1000.0);
             Ok(permit)
         }
         Ok(Err(_)) | Err(_) => {
-            state.metrics.queue_rejections.fetch_add(1, Ordering::Relaxed);
-            Err((StatusCode::TOO_MANY_REQUESTS, Json(ErrorResponse { error: "Execution queue is full".into(), request_id: None })))
+            state
+                .metrics
+                .queue_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse {
+                    error: "Execution queue is full".into(),
+                    request_id: None,
+                }),
+            ))
         }
     }
 }
@@ -580,7 +842,7 @@ pub async fn exec_handler(
         Err(e) => return e.into_response(),
     };
 
-    let request_id = uuid::Uuid::now_v7().to_string();
+    let request_id = uuid::Uuid::new_v4().to_string();
     let rid = request_id.clone();
     let client_ip = extract_client_ip(&state, &headers, addr);
     let masked_key = mask_api_key(&api_key);
@@ -589,9 +851,18 @@ pub async fn exec_handler(
     let response = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         execute_code_internal(&state_for_task, &req, &rid, ExecutionMode::User)
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    log_request(&state, &request_id, &client_ip, &masked_key, &req_for_log, &response);
+    log_request(
+        &state,
+        &request_id,
+        &client_ip,
+        &masked_key,
+        &req_for_log,
+        &response,
+    );
     (StatusCode::OK, Json(response)).into_response()
 }
 
@@ -609,15 +880,23 @@ pub async fn batch_handler(
         return e.into_response();
     }
     if req.executions.len() > state.config.limits.max_batch_size {
-        return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-            error: format!("Batch too large: {} > {}", req.executions.len(), state.config.limits.max_batch_size),
-            request_id: None,
-        })).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Batch too large: {} > {}",
+                    req.executions.len(),
+                    state.config.limits.max_batch_size
+                ),
+                request_id: None,
+            }),
+        )
+            .into_response();
     }
 
     let client_ip = extract_client_ip(&state, &headers, addr);
     let masked_key = mask_api_key(&api_key);
-    
+
     // Acquire ALL permits upfront before spawning any tasks (atomic batch)
     let mut permits = Vec::with_capacity(req.executions.len());
     for _ in 0..req.executions.len() {
@@ -626,19 +905,24 @@ pub async fn batch_handler(
             Err(e) => return e.into_response(),
         };
     }
-    
+
     // Now spawn all tasks - we have all permits
     let mut tasks = Vec::with_capacity(req.executions.len());
     for (index, exec_req) in req.executions.into_iter().enumerate() {
         let permit = permits.remove(0);
         let state_for_task = state.clone();
-        let request_id = uuid::Uuid::now_v7().to_string();
-        let rid = request_id.clone();
+        let request_id_for_task = uuid::Uuid::new_v4().to_string();
+        let rid_for_task = request_id_for_task.clone();
         let req_for_log = exec_req.clone();
         tasks.push(tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let response = execute_code_internal(&state_for_task, &exec_req, &rid, ExecutionMode::User);
-            (index, request_id, req_for_log, response)
+            let response = execute_code_internal(
+                &state_for_task,
+                &exec_req,
+                &rid_for_task,
+                ExecutionMode::User,
+            );
+            (index, request_id_for_task, req_for_log, response)
         }));
     }
 
@@ -647,10 +931,14 @@ pub async fn batch_handler(
         match task.await {
             Ok(tuple) => collected.push(tuple),
             Err(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-                    error: format!("Batch execution task failed: {}", e),
-                    request_id: None,
-                })).into_response();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Batch execution task failed: {}", e),
+                        request_id: None,
+                    }),
+                )
+                    .into_response();
             }
         }
     }
@@ -658,7 +946,14 @@ pub async fn batch_handler(
 
     let mut results = Vec::with_capacity(collected.len());
     for (_, request_id, req_for_log, response) in collected {
-        log_request(&state, &request_id, &client_ip, &masked_key, &req_for_log, &response);
+        log_request(
+            &state,
+            &request_id,
+            &client_ip,
+            &masked_key,
+            &req_for_log,
+            &response,
+        );
         results.push(response);
     }
 
@@ -667,7 +962,7 @@ pub async fn batch_handler(
 
 fn mask_api_key(api_key: &str) -> String {
     if api_key.len() > 8 {
-        format!("{}...{}", &api_key[..4], &api_key[api_key.len()-4..])
+        format!("{}...{}", &api_key[..4], &api_key[api_key.len() - 4..])
     } else {
         "***".to_string()
     }
@@ -677,7 +972,11 @@ fn static_ready_state(state: &AppState) -> HealthResponse {
     let templates = state.template_statuses.clone();
     let all_ready = templates.values().all(|status| status.ready);
     HealthResponse {
-        status: if all_ready { "ok".into() } else { "degraded".into() },
+        status: if all_ready {
+            "ok".into()
+        } else {
+            "degraded".into()
+        },
         templates,
         error: None,
     }
@@ -695,24 +994,48 @@ fn probe_all_templates(state: &AppState) -> HealthResponse {
         let probe = probe_template(state, name);
         let ready = probe.exit_code == 0 && probe.stdout.trim() == "ok";
         if !ready {
-            state.metrics.health_failures.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .health_failures
+                .fetch_add(1, Ordering::Relaxed);
             all_ready = false;
         }
-        templates.insert(name.clone(), TemplateStatus {
-            ready,
-            detail: if ready { "probe ok".into() } else { probe.stderr },
-        });
+        templates.insert(
+            name.clone(),
+            TemplateStatus {
+                ready,
+                detail: if ready {
+                    "probe ok".into()
+                } else {
+                    probe.stderr
+                },
+            },
+        );
     }
-    HealthResponse { status: if all_ready { "ok".into() } else { "degraded".into() }, templates, error: None }
+    HealthResponse {
+        status: if all_ready {
+            "ok".into()
+        } else {
+            "degraded".into()
+        },
+        templates,
+        error: None,
+    }
 }
 
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     // Health probes must acquire a permit to avoid starving user requests
     let permit = match acquire_permit(&state).await {
         Ok(p) => p,
-        Err((status, json)) => return Json(HealthResponse { status: "unavailable".into(), templates: Default::default(), error: Some(format!("{:?} {}", status, json.0.error)) }),
+        Err((status, json)) => {
+            return Json(HealthResponse {
+                status: "unavailable".into(),
+                templates: Default::default(),
+                error: Some(format!("{:?} {}", status, json.0.error)),
+            })
+        }
     };
-    
+
     let ttl = Duration::from_secs(state.config.health.cache_ttl_secs.max(1));
     if let Some(cached) = state.health_cache.lock().unwrap().clone() {
         if cached.generated_at.elapsed() < ttl {
@@ -724,7 +1047,9 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthRe
     let response = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         probe_all_templates(&state_for_task)
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     *state.health_cache.lock().unwrap() = Some(CachedHealthState {
         generated_at: Instant::now(),
         response: response.clone(),
@@ -867,10 +1192,22 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
         fork_sum as f64 / 1000.0,
         exec_sum as f64 / 1000.0,
     );
-    out.push_str(&m.fork_time_hist.render("zeroboot_fork_time_milliseconds", "Distribution of VM fork times in milliseconds"));
-    out.push_str(&m.exec_time_hist.render("zeroboot_exec_time_milliseconds", "Distribution of guest execution times in milliseconds"));
-    out.push_str(&m.total_time_hist.render("zeroboot_total_time_milliseconds", "Distribution of end-to-end request times in milliseconds"));
-    out.push_str(&m.queue_wait_time_hist.render("zeroboot_queue_wait_time_milliseconds", "Distribution of queue wait time before execution in milliseconds"));
+    out.push_str(&m.fork_time_hist.render(
+        "zeroboot_fork_time_milliseconds",
+        "Distribution of VM fork times in milliseconds",
+    ));
+    out.push_str(&m.exec_time_hist.render(
+        "zeroboot_exec_time_milliseconds",
+        "Distribution of guest execution times in milliseconds",
+    ));
+    out.push_str(&m.total_time_hist.render(
+        "zeroboot_total_time_milliseconds",
+        "Distribution of end-to-end request times in milliseconds",
+    ));
+    out.push_str(&m.queue_wait_time_hist.render(
+        "zeroboot_queue_wait_time_milliseconds",
+        "Distribution of queue wait time before execution in milliseconds",
+    ));
     for (language, status) in state.template_statuses.iter() {
         out.push_str(&format!(
             "# TYPE zeroboot_template_ready gauge\nzeroboot_template_ready{{language=\"{}\"}} {}\n",

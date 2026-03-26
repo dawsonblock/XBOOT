@@ -95,7 +95,9 @@ pub fn encode_response_frame(resp: &GuestResponse) -> Vec<u8> {
     body.extend_from_slice(stdout_hex.as_bytes());
     body.extend_from_slice(stderr_hex.as_bytes());
     let checksum = fnv1a32(&body);
-    let flags = (if resp.stdout_truncated { 1 } else { 0 }) | (if resp.stderr_truncated { 2 } else { 0 }) | (if resp.recycle_requested { 4 } else { 0 });
+    let flags = (if resp.stdout_truncated { 1 } else { 0 })
+        | (if resp.stderr_truncated { 2 } else { 0 })
+        | (if resp.recycle_requested { 4 } else { 0 });
     let header = format!(
         "{} {} {} {} {} {} {} {:08x}\n",
         RESPONSE_PREFIX,
@@ -116,7 +118,9 @@ pub fn find_response_frame(buffer: &[u8]) -> Option<Result<ParsedFrame>> {
     let prefix = RESPONSE_PREFIX.as_bytes();
     let mut start = 0usize;
     while start < buffer.len() {
-        let rel = buffer[start..].windows(prefix.len()).position(|w| w == prefix)?;
+        let rel = buffer[start..]
+            .windows(prefix.len())
+            .position(|w| w == prefix)?;
         let frame_start = start + rel;
         let line_end = match buffer[frame_start..].iter().position(|&b| b == b'\n') {
             Some(pos) => frame_start + pos,

@@ -82,7 +82,5 @@ If `ZEROBOOT_ALLOWED_FIRECRACKER_VERSION` is set, `preflight.sh` rejects mismatc
 
 ## Remaining gaps
 
-- no warm VM pool yet
+- no warm VM pool yet (experimental)
 - no live KVM/Firecracker CI lane yet
-- no signed artifact promotion flow yet
-- plain-text API key storage still needs a follow-up hardening pass

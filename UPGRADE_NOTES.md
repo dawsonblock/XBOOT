@@ -29,7 +29,5 @@ This closes a real gap in the prior pass: the server could load a template with 
 
 ## Still missing for a full production bar
 
-- warm pool
+- warm pool (experimental - no server-side pool yet)
 - live KVM integration CI
-- signed/promoted artifact workflow
-- hashed API key storage

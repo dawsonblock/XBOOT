@@ -1,21 +1,23 @@
-use anyhow::{Result, bail};
-use kvm_bindings::*;
+use anyhow::{bail, Result};
 use kvm_bindings::CpuId;
-use kvm_ioctls::{Kvm, VcpuExit, VmFd, VcpuFd};
+use kvm_bindings::*;
+use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use std::ptr;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::protocol::{find_response_frame, GuestResponse};
 use super::serial::Serial;
+use crate::protocol::{find_response_frame, GuestResponse};
 
 extern "C" fn noop_signal_handler(_: libc::c_int) {}
 
 const COM1_PORT: u16 = 0x3f8;
 const COM1_PORT_END: u16 = 0x3ff;
 const COM1_IRQ: u32 = 4;
-
 
 struct TimerGuard {
     cancel: Arc<AtomicBool>,
@@ -37,12 +39,20 @@ impl TimerGuard {
             let handle = std::thread::spawn(move || {
                 std::thread::sleep(dur);
                 if !cancel_thread.load(Ordering::Relaxed) {
-                    unsafe { libc::pthread_kill(thread_id, libc::SIGALRM); }
+                    unsafe {
+                        libc::pthread_kill(thread_id, libc::SIGALRM);
+                    }
                 }
             });
-            Self { cancel, handle: Some(handle) }
+            Self {
+                cancel,
+                handle: Some(handle),
+            }
         } else {
-            Self { cancel: Arc::new(AtomicBool::new(true)), handle: None }
+            Self {
+                cancel: Arc::new(AtomicBool::new(true)),
+                handle: None,
+            }
         }
     }
 }
@@ -68,7 +78,6 @@ pub struct VmSnapshot {
     pub mem_size: usize,
 }
 
-
 pub struct ForkedVm {
     pub vm_fd: VmFd,
     pub vcpu_fd: VcpuFd,
@@ -78,7 +87,6 @@ pub struct ForkedVm {
     pub fork_time_us: f64,
     _kvm: Kvm,
 }
-
 
 impl ForkedVm {
     pub fn fork_cow(snapshot: &VmSnapshot, memfd: i32) -> Result<Self> {
@@ -97,22 +105,27 @@ impl ForkedVm {
                 chip_id: KVM_IRQCHIP_IOAPIC,
                 ..Default::default()
             };
-            vm_fd.get_irqchip(&mut irqchip)
+            vm_fd
+                .get_irqchip(&mut irqchip)
                 .map_err(|e| anyhow::anyhow!("get_irqchip(IOAPIC): {}", e))?;
             unsafe {
                 for i in 0..24 {
                     irqchip.chip.ioapic.redirtbl[i].bits = snapshot.ioapic_redirtbl[i];
                 }
             }
-            vm_fd.set_irqchip(&irqchip)
+            vm_fd
+                .set_irqchip(&irqchip)
                 .map_err(|e| anyhow::anyhow!("set_irqchip(IOAPIC): {}", e))?;
         }
 
         let fork_mem = unsafe {
             libc::mmap(
-                ptr::null_mut(), snapshot.mem_size,
+                ptr::null_mut(),
+                snapshot.mem_size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_NORESERVE, memfd, 0,
+                libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                memfd,
+                0,
             )
         };
         if fork_mem == libc::MAP_FAILED {
@@ -121,9 +134,11 @@ impl ForkedVm {
 
         unsafe {
             vm_fd.set_user_memory_region(kvm_userspace_memory_region {
-                slot: 0, guest_phys_addr: 0,
+                slot: 0,
+                guest_phys_addr: 0,
                 memory_size: snapshot.mem_size as u64,
-                userspace_addr: fork_mem as u64, flags: 0,
+                userspace_addr: fork_mem as u64,
+                flags: 0,
             })?;
         }
 
@@ -146,13 +161,18 @@ impl ForkedVm {
 
         // Restore XCRS (must be after sregs — CR4.OSXSAVE must be set first)
         if snapshot.xcrs.nr_xcrs > 0 {
-            vcpu_fd.set_xcrs(&snapshot.xcrs)
+            vcpu_fd
+                .set_xcrs(&snapshot.xcrs)
                 .map_err(|e| anyhow::anyhow!("set_xcrs: {}", e))?;
         }
 
         // Restore XSAVE (FPU/SSE/AVX state — must be after XCRS)
-        vcpu_fd.set_xsave(&snapshot.xsave)
-            .map_err(|e| anyhow::anyhow!("set_xsave: {}", e))?;
+        // SAFETY: Restoring xsave state from a previously saved valid VM state
+        unsafe {
+            vcpu_fd
+                .set_xsave(&snapshot.xsave)
+                .map_err(|e| anyhow::anyhow!("set_xsave: {}", e))?;
+        }
 
         vcpu_fd.set_regs(&snapshot.regs)?;
 
@@ -164,7 +184,9 @@ impl ForkedVm {
             let mut msrs = Msrs::new(snapshot.msrs.len()).unwrap();
             for (i, entry) in snapshot.msrs.iter().enumerate() {
                 let mut e = *entry;
-                if e.index == 0x4b564d00 { e.data |= 1; }
+                if e.index == 0x4b564d00 {
+                    e.data |= 1;
+                }
                 msrs.as_mut_slice()[i] = e;
             }
             let _ = vcpu_fd.set_msrs(&msrs);
@@ -174,16 +196,23 @@ impl ForkedVm {
         let _ = vcpu_fd.set_mp_state(kvm_mp_state { mp_state: 0 });
 
         Ok(Self {
-            _kvm: kvm, vm_fd, vcpu_fd,
-            mem_ptr: fork_mem as *mut u8, mem_size: snapshot.mem_size,
+            _kvm: kvm,
+            vm_fd,
+            vcpu_fd,
+            mem_ptr: fork_mem as *mut u8,
+            mem_size: snapshot.mem_size,
             serial: Serial::new(),
             fork_time_us: start.elapsed().as_secs_f64() * 1_000_000.0,
         })
     }
 
     pub fn inject_serial_irq(&self) -> Result<()> {
-        self.vm_fd.set_irq_line(COM1_IRQ, true).map_err(|e| anyhow::anyhow!("{}", e))?;
-        self.vm_fd.set_irq_line(COM1_IRQ, false).map_err(|e| anyhow::anyhow!("{}", e))?;
+        self.vm_fd
+            .set_irq_line(COM1_IRQ, true)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        self.vm_fd
+            .set_irq_line(COM1_IRQ, false)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(())
     }
 
@@ -199,7 +228,10 @@ impl ForkedVm {
         self.run_until_marker_timeout(marker, max_exits, None)
     }
 
-    pub fn run_until_response_timeout(&mut self, timeout: Option<Duration>) -> Result<GuestResponse> {
+    pub fn run_until_response_timeout(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<GuestResponse> {
         if self.serial.has_pending_input() {
             self.serial.set_ier_data_ready(true);
             let _ = self.inject_serial_irq();
@@ -230,7 +262,9 @@ impl ForkedVm {
                             io_out_count += 1;
                             let offset = port - COM1_PORT;
                             let _thri_before = self.serial.thri_enabled();
-                            for &b in data { self.serial.write(offset, b); }
+                            for &b in data {
+                                self.serial.write(offset, b);
+                            }
                             // Level-triggered THRI: keep IRQ line asserted while
                             // THRI is enabled and de-assert when disabled. This
                             // matches real UART behavior where THRE interrupt
@@ -245,12 +279,25 @@ impl ForkedVm {
                             if debug && offset == 0 && exit_count < 5000 {
                                 let ch = data[0];
                                 if (0x20..0x7f).contains(&ch) {
-                                    eprintln!("  [{}] IoOut chr='{}' out_len={}", exit_count, ch as char, self.serial.output.len());
+                                    eprintln!(
+                                        "  [{}] IoOut chr='{}' out_len={}",
+                                        exit_count,
+                                        ch as char,
+                                        self.serial.output.len()
+                                    );
                                 } else {
-                                    eprintln!("  [{}] IoOut byte=0x{:02x} out_len={}", exit_count, ch, self.serial.output.len());
+                                    eprintln!(
+                                        "  [{}] IoOut byte=0x{:02x} out_len={}",
+                                        exit_count,
+                                        ch,
+                                        self.serial.output.len()
+                                    );
                                 }
                             } else if debug && exit_count < 5000 {
-                                eprintln!("  [{}] IoOut reg={} val=0x{:02x}", exit_count, offset, data[0]);
+                                eprintln!(
+                                    "  [{}] IoOut reg={} val=0x{:02x}",
+                                    exit_count, offset, data[0]
+                                );
                             }
                             if let Some(parsed) = find_response_frame(&self.serial.output) {
                                 return parsed.map(|frame| frame.response);
@@ -268,9 +315,19 @@ impl ForkedVm {
                                 if offset == 0 {
                                     let ch = data[0];
                                     if (0x20..0x7f).contains(&ch) {
-                                        eprintln!("  [{}] IoIn  RX chr='{}' pending={}", exit_count, ch as char, self.serial.input_len());
+                                        eprintln!(
+                                            "  [{}] IoIn  RX chr='{}' pending={}",
+                                            exit_count,
+                                            ch as char,
+                                            self.serial.input_len()
+                                        );
                                     } else {
-                                        eprintln!("  [{}] IoIn  RX byte=0x{:02x} pending={}", exit_count, ch, self.serial.input_len());
+                                        eprintln!(
+                                            "  [{}] IoIn  RX byte=0x{:02x} pending={}",
+                                            exit_count,
+                                            ch,
+                                            self.serial.input_len()
+                                        );
                                     }
                                 } else if offset == 2 {
                                     eprintln!("  [{}] IoIn  IIR=0x{:02x}", exit_count, data[0]);
@@ -284,11 +341,22 @@ impl ForkedVm {
                     }
                     VcpuExit::Hlt => {
                         hlt_count += 1;
-                        if debug { eprintln!("  [{}] HLT pending={}", exit_count, self.serial.has_pending_input()); }
+                        if debug {
+                            eprintln!(
+                                "  [{}] HLT pending={}",
+                                exit_count,
+                                self.serial.has_pending_input()
+                            );
+                        }
                         if self.serial.has_pending_input() {
                             let _ = self.inject_serial_irq();
                         } else {
-                            if debug { eprintln!("  DONE: exits={} io_in={} io_out={} hlt={}", exit_count, io_in_count, io_out_count, hlt_count); }
+                            if debug {
+                                eprintln!(
+                                    "  DONE: exits={} io_in={} io_out={} hlt={}",
+                                    exit_count, io_in_count, io_out_count, hlt_count
+                                );
+                            }
                             if let Some(parsed) = find_response_frame(&self.serial.output) {
                                 return parsed.map(|frame| frame.response);
                             }
@@ -301,13 +369,19 @@ impl ForkedVm {
                         }
                         bail!("guest shut down before sending a structured response");
                     }
-                    VcpuExit::MmioRead(_, data) => { for b in data.iter_mut() { *b = 0xff; } }
+                    VcpuExit::MmioRead(_, data) => {
+                        for b in data.iter_mut() {
+                            *b = 0xff;
+                        }
+                    }
                     VcpuExit::MmioWrite(_, _) => {}
                     VcpuExit::InternalError => bail!("KVM internal error"),
                     _ => {}
                 },
                 Err(e) => {
-                    if e.errno() == libc::EAGAIN { continue; }
+                    if e.errno() == libc::EAGAIN {
+                        continue;
+                    }
                     if e.errno() == libc::EINTR {
                         // Signal interrupted KVM_RUN — check if we've timed out
                         if let Some(dl) = deadline {
@@ -324,7 +398,12 @@ impl ForkedVm {
     }
 
     #[allow(dead_code)]
-    pub fn run_until_marker_timeout(&mut self, marker: &str, max_exits: u64, timeout: Option<Duration>) -> Result<String> {
+    pub fn run_until_marker_timeout(
+        &mut self,
+        marker: &str,
+        max_exits: u64,
+        timeout: Option<Duration>,
+    ) -> Result<String> {
         if self.serial.has_pending_input() {
             self.serial.set_ier_data_ready(true);
             let _ = self.inject_serial_irq();
@@ -354,7 +433,9 @@ impl ForkedVm {
                         if (COM1_PORT..=COM1_PORT_END).contains(&port) {
                             io_out_count += 1;
                             let offset = port - COM1_PORT;
-                            for &b in data { self.serial.write(offset, b); }
+                            for &b in data {
+                                self.serial.write(offset, b);
+                            }
                             if offset == 1 {
                                 if self.serial.thri_enabled() {
                                     let _ = self.vm_fd.set_irq_line(COM1_IRQ, true);
@@ -365,9 +446,19 @@ impl ForkedVm {
                             if debug && offset == 0 && exit_count < 5000 {
                                 let ch = data[0];
                                 if (0x20..0x7f).contains(&ch) {
-                                    eprintln!("  [{}] IoOut chr='{}' out_len={}", exit_count, ch as char, self.serial.output.len());
+                                    eprintln!(
+                                        "  [{}] IoOut chr='{}' out_len={}",
+                                        exit_count,
+                                        ch as char,
+                                        self.serial.output.len()
+                                    );
                                 } else {
-                                    eprintln!("  [{}] IoOut byte=0x{:02x} out_len={}", exit_count, ch, self.serial.output.len());
+                                    eprintln!(
+                                        "  [{}] IoOut byte=0x{:02x} out_len={}",
+                                        exit_count,
+                                        ch,
+                                        self.serial.output.len()
+                                    );
                                 }
                             }
                             if String::from_utf8_lossy(&self.serial.output).contains(marker) {
@@ -391,20 +482,31 @@ impl ForkedVm {
                         if self.serial.has_pending_input() {
                             let _ = self.inject_serial_irq();
                         } else {
-                            if debug { eprintln!("  DONE: exits={} io_in={} io_out={} hlt={}", exit_count, io_in_count, io_out_count, hlt_count); }
+                            if debug {
+                                eprintln!(
+                                    "  DONE: exits={} io_in={} io_out={} hlt={}",
+                                    exit_count, io_in_count, io_out_count, hlt_count
+                                );
+                            }
                             return Ok(String::from_utf8_lossy(&self.serial.output).to_string());
                         }
                     }
                     VcpuExit::Shutdown => {
                         return Ok(String::from_utf8_lossy(&self.serial.output).to_string());
                     }
-                    VcpuExit::MmioRead(_, data) => { for b in data.iter_mut() { *b = 0xff; } }
+                    VcpuExit::MmioRead(_, data) => {
+                        for b in data.iter_mut() {
+                            *b = 0xff;
+                        }
+                    }
                     VcpuExit::MmioWrite(_, _) => {}
                     VcpuExit::InternalError => bail!("KVM internal error"),
                     _ => {}
                 },
                 Err(e) => {
-                    if e.errno() == libc::EAGAIN { continue; }
+                    if e.errno() == libc::EAGAIN {
+                        continue;
+                    }
                     if e.errno() == libc::EINTR {
                         if let Some(dl) = deadline {
                             if Instant::now() >= dl {
@@ -423,24 +525,38 @@ impl ForkedVm {
 
 impl Drop for ForkedVm {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.mem_ptr as *mut libc::c_void, self.mem_size); }
+        unsafe {
+            libc::munmap(self.mem_ptr as *mut libc::c_void, self.mem_size);
+        }
     }
 }
 
 pub fn create_snapshot_memfd(mem_ptr: *const u8, mem_size: usize) -> Result<i32> {
     let name = std::ffi::CString::new("zeroboot-snapshot").unwrap();
     let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 { bail!("memfd_create failed"); }
+    if fd < 0 {
+        bail!("memfd_create failed");
+    }
     if unsafe { libc::ftruncate(fd, mem_size as i64) } < 0 {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         bail!("ftruncate failed");
     }
     let dst = unsafe {
-        libc::mmap(ptr::null_mut(), mem_size, libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED, fd, 0)
+        libc::mmap(
+            ptr::null_mut(),
+            mem_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
     };
     if dst == libc::MAP_FAILED {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         bail!("mmap failed");
     }
     unsafe {
