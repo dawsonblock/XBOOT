@@ -44,12 +44,15 @@ pub struct ArtifactConfig {
     pub require_template_hashes: bool,
     pub allowed_firecracker_version: Option<String>,
     pub allowed_firecracker_binary_sha256: Option<String>,
+    #[allow(dead_code)]
     pub release_channel: Option<String>,
+    #[allow(dead_code)]
     pub require_template_signatures: bool,
     pub keyring_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PoolConfig {
     pub min_idle_per_lang: usize,
     pub max_idle_per_lang: usize,
@@ -69,23 +72,36 @@ pub struct ServerConfig {
     pub bind_addr: String,
     pub queue: QueueConfig,
     pub artifacts: ArtifactConfig,
+    #[allow(dead_code)]
     pub pool: PoolConfig,
 }
 
 impl ServerConfig {
     pub fn from_env() -> Result<Self> {
-        let auth_mode_prod = match env::var("ZEROBOOT_AUTH_MODE").unwrap_or_else(|_| "dev".into()).to_lowercase().as_str() {
+        let auth_mode_prod = match env::var("ZEROBOOT_AUTH_MODE")
+            .unwrap_or_else(|_| "dev".into())
+            .to_lowercase()
+            .as_str()
+        {
             "dev" => false,
             "prod" | "production" => true,
             other => bail!("unsupported ZEROBOOT_AUTH_MODE: {}", other),
         };
-        let auth_mode = if auth_mode_prod { AuthMode::Prod } else { AuthMode::Dev };
+        let auth_mode = if auth_mode_prod {
+            AuthMode::Prod
+        } else {
+            AuthMode::Dev
+        };
         let trusted_proxies = env::var("ZEROBOOT_TRUSTED_PROXIES")
             .unwrap_or_default()
             .split(',')
             .filter_map(|s| {
                 let s = s.trim();
-                if s.is_empty() { None } else { s.parse().ok() }
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse().ok()
+                }
             })
             .collect();
         Ok(Self {
@@ -123,12 +139,27 @@ impl ServerConfig {
                 wait_timeout_ms: u64_env("ZEROBOOT_QUEUE_WAIT_TIMEOUT_MS", 250),
             },
             artifacts: ArtifactConfig {
-                require_template_hashes: bool_env("ZEROBOOT_REQUIRE_TEMPLATE_HASHES", auth_mode_prod),
-                allowed_firecracker_version: env::var("ZEROBOOT_ALLOWED_FIRECRACKER_VERSION").ok().filter(|s| !s.trim().is_empty()),
-                allowed_firecracker_binary_sha256: env::var("ZEROBOOT_ALLOWED_FC_BINARY_SHA256").ok().filter(|s| !s.trim().is_empty()),
-                release_channel: env::var("ZEROBOOT_RELEASE_CHANNEL").ok().filter(|s| !s.trim().is_empty()),
-                require_template_signatures: bool_env("ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES", auth_mode_prod),
-                keyring_path: env::var("ZEROBOOT_KEYRING_PATH").ok().filter(|s| !s.trim().is_empty()).map(PathBuf::from),
+                require_template_hashes: bool_env(
+                    "ZEROBOOT_REQUIRE_TEMPLATE_HASHES",
+                    auth_mode_prod,
+                ),
+                allowed_firecracker_version: env::var("ZEROBOOT_ALLOWED_FIRECRACKER_VERSION")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
+                allowed_firecracker_binary_sha256: env::var("ZEROBOOT_ALLOWED_FC_BINARY_SHA256")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
+                release_channel: env::var("ZEROBOOT_RELEASE_CHANNEL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
+                require_template_signatures: bool_env(
+                    "ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES",
+                    auth_mode_prod,
+                ),
+                keyring_path: env::var("ZEROBOOT_KEYRING_PATH")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(PathBuf::from),
             },
             pool: PoolConfig {
                 min_idle_per_lang: usize_env("ZEROBOOT_POOL_MIN_PER_LANG", 0),
@@ -145,11 +176,17 @@ impl ServerConfig {
 }
 
 fn usize_env(name: &str, default: usize) -> usize {
-    env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn u64_env(name: &str, default: u64) -> u64 {
-    env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn bool_env(name: &str, default: bool) -> bool {
@@ -181,12 +218,18 @@ mod tests {
                 max_timeout_secs: 1,
                 max_concurrent_requests: 1,
             },
-            logging: LoggingConfig { path: PathBuf::from("x"), log_code: false },
-            health: HealthConfig { probe_timeout_secs: 1, cache_ttl_secs: 1 },
+            logging: LoggingConfig {
+                path: PathBuf::from("x"),
+                log_code: false,
+            },
+            health: HealthConfig {
+                probe_timeout_secs: 1,
+                cache_ttl_secs: 1,
+            },
             bind_addr: "127.0.0.1".into(),
             queue: QueueConfig { wait_timeout_ms: 1 },
-            artifacts: ArtifactConfig { 
-                require_template_hashes: false, 
+            artifacts: ArtifactConfig {
+                require_template_hashes: false,
                 allowed_firecracker_version: None,
                 allowed_firecracker_binary_sha256: None,
                 release_channel: None,

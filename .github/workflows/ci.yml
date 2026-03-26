@@ -23,6 +23,10 @@ jobs:
         run: bash -n verify.sh deploy/deploy.sh scripts/build_guest_rootfs.sh scripts/build_rootfs_image.sh scripts/preflight.sh
       - name: unit tests
         run: python -m unittest discover -s tests -p 'test_*.py'
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings -A dead_code -A unused_variables -A unused_imports -A empty_line_after_doc_comments -A renamed_and_removed_lints
       - name: cargo tests
         run: cargo test --locked
 

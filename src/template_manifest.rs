@@ -29,7 +29,7 @@ pub struct TemplateManifest {
     pub build_id: Option<String>,
     #[serde(default)]
     pub artifact_set_id: Option<String>,
-    
+
     // Trust and promotion
     #[serde(default)]
     pub promotion_channel: Option<String>, // dev | staging | prod
@@ -39,7 +39,7 @@ pub struct TemplateManifest {
     pub manifest_signature: Option<String>,
     #[serde(default)]
     pub manifest_signed_fields: Option<Vec<String>>,
-    
+
     // Build provenance
     #[serde(default)]
     pub built_from_git_rev: Option<String>,
@@ -47,7 +47,7 @@ pub struct TemplateManifest {
     pub build_host: Option<String>,
     #[serde(default)]
     pub firecracker_binary_sha256: Option<String>,
-    
+
     // Original fields (kept for compatibility)
     #[serde(default)]
     pub language: Option<String>,
@@ -89,8 +89,6 @@ pub fn read_manifest(workdir: &Path) -> Result<TemplateManifest> {
         .with_context(|| format!("invalid template manifest {}", manifest_path.display()))
 }
 
-
-
 pub fn sha256_hex(path: &Path) -> Result<String> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -106,7 +104,12 @@ pub fn sha256_hex(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn verify_hash_if_present(path: &Path, expected: Option<&str>, require_hashes: bool, label: &str) -> Result<()> {
+fn verify_hash_if_present(
+    path: &Path,
+    expected: Option<&str>,
+    require_hashes: bool,
+    label: &str,
+) -> Result<()> {
     match expected {
         Some(expected_hash) => {
             let actual = sha256_hex(path)?;
@@ -144,9 +147,11 @@ pub fn resolve_path_confined(workdir: &Path, raw: &str) -> Result<PathBuf> {
         workdir.join(raw)
     };
 
-    let canon_workdir = workdir.canonicalize()
+    let canon_workdir = workdir
+        .canonicalize()
         .with_context(|| format!("canonicalize workdir {}", workdir.display()))?;
-    let canon_joined = joined.canonicalize()
+    let canon_joined = joined
+        .canonicalize()
         .with_context(|| format!("canonicalize template path {}", joined.display()))?;
 
     if !canon_joined.starts_with(&canon_workdir) {
@@ -161,7 +166,7 @@ pub fn resolve_path_confined(workdir: &Path, raw: &str) -> Result<PathBuf> {
 }
 
 /// Verify template artifacts with enhanced security checks.
-/// 
+///
 /// In Prod mode, this enforces:
 /// - No missing schema_version
 /// - promotion_channel must be "prod" (not "dev" or "staging")
@@ -203,38 +208,42 @@ pub fn verify_template_artifacts(
             if manifest.manifest_signature.is_none() {
                 bail!("prod mode requires template signatures but none present");
             }
-            
+
             // Real signature verification
-            let signer_key_id = manifest.signer_key_id.as_deref()
-                .ok_or_else(|| anyhow::anyhow!("template has signature but missing signer_key_id"))?;
+            let signer_key_id = manifest.signer_key_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("template has signature but missing signer_key_id")
+            })?;
             let signature = manifest.manifest_signature.as_ref().unwrap();
-            
+
             // Serialize manifest to JSON for verification
             let manifest_json = serde_json::to_string(&manifest)?;
-            
+
             // Load keyring if path provided
             let keyring = if let Some(path) = keyring_path {
                 Some(signing::load_keyring(path)?)
             } else {
                 None
             };
-            
+
             // Verify the signature
             signing::verify_manifest_signature(
                 &manifest_json,
                 signer_key_id,
                 signature,
                 keyring.as_ref(),
-            ).map_err(|e| anyhow::anyhow!("signature verification failed: {}", e))?;
+            )
+            .map_err(|e| anyhow::anyhow!("signature verification failed: {}", e))?;
         }
 
         // 4. Validate Firecracker binary hash if configured
         if let Some(expected_fc_sha256) = allowed_firecracker_binary_sha256 {
             match manifest.firecracker_binary_sha256.as_deref() {
-                Some(actual_sha256) if actual_sha256.to_lowercase() == expected_fc_sha256.to_lowercase() => {}
+                Some(actual_sha256)
+                    if actual_sha256.to_lowercase() == expected_fc_sha256.to_lowercase() => {}
                 Some(actual_sha256) => bail!(
                     "Firecracker binary sha256 mismatch: expected {}, got {}",
-                    expected_fc_sha256, actual_sha256
+                    expected_fc_sha256,
+                    actual_sha256
                 ),
                 None => bail!("template manifest missing firecracker_binary_sha256 in prod mode"),
             }
@@ -242,11 +251,15 @@ pub fn verify_template_artifacts(
     }
 
     // === EXISTING VALIDATION LOGIC ===
-    
+
     if let Some(expected) = expected_language {
         match manifest.language.as_deref() {
             Some(actual) if actual == expected => {}
-            Some(actual) => bail!("template language mismatch: expected {}, got {}", expected, actual),
+            Some(actual) => bail!(
+                "template language mismatch: expected {}, got {}",
+                expected,
+                actual
+            ),
             None => bail!("template manifest missing language"),
         }
     }
@@ -286,7 +299,7 @@ pub fn verify_template_artifacts(
     } else {
         resolve_path(workdir, &manifest.snapshot_mem_path)
     };
-    
+
     let state_meta = std::fs::metadata(&state_path)
         .with_context(|| format!("missing snapshot state file {}", state_path.display()))?;
     let mem_meta = std::fs::metadata(&mem_path)
