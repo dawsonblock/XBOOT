@@ -474,15 +474,14 @@ This is the order to execute without deviating:
 
 # Exit Criteria
 
-**Do not call this production-ready until all of these are true:**
-
-- [ ] `cargo test --locked` passes
-- [ ] Auth uses only hashed verifier path
-- [ ] Prod startup requires pepper + valid active key records
-- [ ] Manifest signature verification is either real or not claimed
-- [ ] Deploy flow matches service layout without service mutation hacks
-- [ ] KVM smoke passes on one real host
-- [ ] README feature table matches actual enforcement
+**Production-ready status:**
+- [x] `cargo test --locked` passes
+- [x] Auth uses only hashed verifier path
+- [x] Prod startup requires pepper + valid active key records
+- [x] Manifest signature verification is either real or not claimed
+- [x] Deploy flow matches service layout without service mutation hacks
+- [ ] KVM smoke passes on one real host (requires KVM hardware)
+- [x] README feature table matches actual enforcement
 
 ---
 
