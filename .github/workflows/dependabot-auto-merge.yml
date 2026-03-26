@@ -1,0 +1,73 @@
+name: Dependabot Auto-Merge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# Allow the workflow to read repository contents and write to PRs
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dependabot:
+    runs-on: ubuntu-latest
+    if: ${{ github.actor == 'dependabot[bot]' }}
+    steps:
+      - name: Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Wait for tests
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = context.payload.pull_request.number;
+            core.info(`Checking PR #${prNumber}`);
+            
+            // Poll for status checks to complete
+            const maxAttempts = 60; // 5 minutes max
+            let attempts = 0;
+            
+            while (attempts < maxAttempts) {
+              const { data: prDetails } = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: prNumber,
+              });
+              
+              if (prDetails.mergeable_state === 'clean' || prDetails.mergeable_state === 'unblocked') {
+                core.info('PR is mergeable!');
+                return;
+              }
+              
+              if (prDetails.mergeable_state === 'dirty') {
+                core.setFailed('PR has merge conflicts');
+                return;
+              }
+              
+              core.info(`State: ${prDetails.mergeable_state}, waiting...`);
+              await new Promise(r => setTimeout(r, 5000));
+              attempts++;
+            }
+            
+            core.setFailed('Timeout waiting for PR to become mergeable');
+
+      - name: Approve PR
+        run: |
+          gh pr review --approve "$PR_NUMBER"
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge
+        run: |
+          gh pr merge --auto --squash "$PR_NUMBER"
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
