@@ -32,12 +32,16 @@ fn main() -> Result<()> {
         "bench" | "fork-bench" => cmd_fork_bench(&args[2..]),
         "serve" => cmd_serve(&args[2..]),
         "test-exec" => cmd_test_exec(&args[2..]),
+        "sign" => cmd_sign(&args[2..]),
+        "keygen" => cmd_keygen(&args[2..]),
         _ => {
             eprintln!("Usage: zeroboot <command>");
             eprintln!("  template <kernel> <rootfs> <workdir> [wait_secs] [init_path] [mem_mib]");
             eprintln!("  bench <workdir> [language]");
             eprintln!("  test-exec <workdir> [language] <code>");
             eprintln!("  serve <workdir>[,lang:workdir2,...] [port]");
+            eprintln!("  sign <key> <manifest>");
+            eprintln!("  keygen");
             Ok(())
         }
     }
@@ -481,4 +485,70 @@ fn print_percentiles(label: &str, times: &[f64]) {
     println!("    P95:  {:>8.1} µs ({:.3} ms)", times[n * 95 / 100], times[n * 95 / 100] / 1000.0);
     println!("    P99:  {:>8.1} µs ({:.3} ms)", times[n * 99 / 100], times[n * 99 / 100] / 1000.0);
     println!("    Max:  {:>8.1} µs ({:.3} ms)", times[n - 1], times[n - 1] / 1000.0);
+}
+
+fn cmd_keygen(args: &[String]) -> Result<()> {
+    use std::io::Write;
+    
+    let (pkcs8, public_key) = signing::generate_key_pair()?;
+    let key_id = signing::get_key_id(&public_key);
+    
+    println!("Key ID: {}", key_id);
+    println!("Public Key (base64):");
+    println!("  {}", signing::format_public_key_base64(&public_key));
+    
+    // Write private key to file
+    let key_path_str = args.first().map(|s| s.as_str()).unwrap_or("key.pkcs8");
+    let key_path = Path::new(key_path_str);
+    let mut file = std::fs::File::create(key_path)?;
+    file.write_all(&pkcs8)?;
+    
+    println!("Private key written to: {}", key_path.display());
+    println!("");
+    println!("To add to keyring, add this to your keyring.json:");
+    println!("{{");
+    println!("  \"id\": \"{}\",", key_id);
+    println!("  \"algorithm\": \"ed25519\",");
+    println!("  \"public_key\": \"{}\",", signing::format_public_key_base64(&public_key));
+    println!("  \"enabled\": true,");
+    println!("  \"description\": \"production signing key\"");
+    println!("}}");
+    
+    Ok(())
+}
+
+fn cmd_sign(args: &[String]) -> Result<()> {
+    if args.len() < 2 {
+        bail!("Usage: zeroboot sign <key_path> <manifest_path>");
+    }
+    
+    let key_path = Path::new(&args[0]);
+    let manifest_path = Path::new(&args[1]);
+    
+    let key_bytes = std::fs::read(key_path)?;
+    let manifest_json = std::fs::read_to_string(manifest_path)?;
+    
+    // Sign the core identity fields
+    let signed_fields = ["template_id", "build_id", "artifact_set_id", "promotion_channel"];
+    let (signature, _) = signing::sign_manifest(&key_bytes, &manifest_json, &signed_fields)?;
+    
+    // Get key ID
+    let public_key = signing::export_public_key(&key_bytes)?;
+    let key_id = signing::get_key_id(&public_key);
+    
+    // Update manifest with signature
+    let mut manifest: serde_json::Value = serde_json::from_str(&manifest_json)?;
+    manifest["signer_key_id"] = serde_json::json!(key_id);
+    manifest["manifest_signature"] = serde_json::json!(signature);
+    manifest["manifest_signed_fields"] = serde_json::json!(signed_fields);
+    
+    // Write signed manifest
+    let signed_json = serde_json::to_string_pretty(&manifest)?;
+    std::fs::write(manifest_path, signed_json)?;
+    
+    println!("Manifest signed with key ID: {}", key_id);
+    println!("Signature: {}", signature);
+    println!("Signed fields: {:?}", signed_fields);
+    
+    Ok(())
 }

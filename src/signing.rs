@@ -260,6 +260,43 @@ pub fn export_public_key(key_pair_bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(key_pair.public_key().as_ref().to_vec())
 }
 
+/// Sign a manifest and return the signature
+///
+/// Takes the private key (pkcs8 format) and manifest JSON,
+/// signs it with Ed25519, and returns the signature as base64.
+pub fn sign_manifest(key_pair_bytes: &[u8], manifest_json: &str, signed_fields: &[&str]) -> Result<(String, String)> {
+    use ring::signature::Ed25519KeyPair;
+    
+    let key_pair = Ed25519KeyPair::from_pkcs8(key_pair_bytes)
+        .map_err(|e| anyhow::anyhow!("invalid key pair: {:?}", e))?;
+    
+    // Extract and canonicalize the signed content
+    let manifest: serde_json::Value = serde_json::from_str(manifest_json)
+        .context("invalid manifest JSON")?;
+    
+    let mut signed_content = String::new();
+    for field in signed_fields {
+        if let Some(value) = manifest.get(field) {
+            let canonical = serde_json::to_string(value)
+                .context(format!("canonicalize field '{}'", field))?;
+            signed_content.push_str(&canonical);
+        }
+    }
+    
+    let signature = key_pair.sign(signed_content.as_bytes());
+    let signature_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.as_ref());
+    
+    Ok((signature_b64, signed_content))
+}
+
+/// Get the public key ID from a key pair (SHA256 hash of public key)
+pub fn get_key_id(public_key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(public_key);
+    hex::encode(hasher.finalize())[..16].to_string()
+}
+
 /// Sign data with a key pair
 pub fn sign_data(key_pair_bytes: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     use ring::signature::Ed25519KeyPair;
