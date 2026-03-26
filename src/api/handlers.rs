@@ -655,11 +655,9 @@ pub async fn batch_handler(
     for (index, exec_req) in req.executions.into_iter().enumerate() {
         let permit = permits.remove(0);
         let state_for_task = state.clone();
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let rid = request_id.clone();
-        let req_for_log = exec_req.clone();
         let request_id_for_task = uuid::Uuid::new_v4().to_string();
         let rid_for_task = request_id_for_task.clone();
+        let req_for_log = exec_req.clone();
         tasks.push(tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let response = execute_code_internal(&state_for_task, &exec_req, &rid_for_task, ExecutionMode::User);

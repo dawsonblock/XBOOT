@@ -2,7 +2,6 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::io::Write;
 
 /// API key record stored on server - contains hash, not the actual key
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,7 +165,7 @@ mod tests {
             pepper: pepper.to_string(),
         };
         
-        assert!(verifier.verify(&token).unwrap());
+        assert!(verifier.verify(&token).is_ok());
     }
 
     #[test]
@@ -182,7 +181,7 @@ mod tests {
             pepper: pepper.to_string(),
         };
         
-        assert!(!verifier.verify("invalid.token").unwrap());
+        assert!(verifier.verify("invalid.token").is_err());
     }
 
     #[test]
@@ -202,6 +201,6 @@ mod tests {
         let parts: Vec<&str> = token.split('.').collect();
         let wrong_token = format!("{}.{}", parts[0], "wrong-secret");
         
-        assert!(!verifier.verify(&wrong_token).unwrap());
+        assert!(verifier.verify(&wrong_token).is_err());
     }
 }
