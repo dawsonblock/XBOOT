@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Warm Pool Autoscaler
+Warm Pool Autoscaler (EXPERIMENTAL)
+
+WARNING: This script is experimental. There is no server-side VM pool
+implementation yet. This script assumes metrics that don't exist in the
+current zeroboot server.
 
 Manages a pool of pre-warmed VMs for fast request handling.
 Scales pool size based on demand metrics.
