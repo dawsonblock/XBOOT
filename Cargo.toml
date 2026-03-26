@@ -22,6 +22,8 @@ anyhow = "1"
 uuid = { version = "1", features = ["v7"] }
 sha2 = "0.10"
 hmac-sha256 = "2"
+ring = "0.17"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3

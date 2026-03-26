@@ -287,10 +287,10 @@ The guest init applies setrlimit():
 
 ## Roadmap
 
-- Full signature verification with trusted keyring
-- Reproducible guest image builder
-- Multi-version Firecracker compatibility matrix
-- Warm pool autoscaling
+- [x] Full signature verification with trusted keyring (Ed25519 via ring crate)
+- [x] Reproducible guest image builder (scripts/build_reproducible_image.py)
+- [x] Multi-version Firecracker compatibility matrix (scripts/firecracker_compat.py)
+- [x] Warm pool autoscaling (scripts/warm_pool_scaler.py)
 
 ---
 
