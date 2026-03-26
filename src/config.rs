@@ -43,12 +43,24 @@ pub struct QueueConfig {
 pub struct ArtifactConfig {
     pub require_template_hashes: bool,
     pub allowed_firecracker_version: Option<String>,
+    pub allowed_firecracker_binary_sha256: Option<String>,
+    pub release_channel: Option<String>,
+    pub require_template_signatures: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    pub min_idle_per_lang: usize,
+    pub max_idle_per_lang: usize,
+    pub borrow_timeout_ms: u64,
+    pub health_check_interval_secs: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub auth_mode: AuthMode,
     pub api_keys_file: PathBuf,
+    pub api_key_pepper_file: PathBuf,
     pub trusted_proxies: Vec<IpAddr>,
     pub limits: Limits,
     pub logging: LoggingConfig,
@@ -56,6 +68,7 @@ pub struct ServerConfig {
     pub bind_addr: String,
     pub queue: QueueConfig,
     pub artifacts: ArtifactConfig,
+    pub pool: PoolConfig,
 }
 
 impl ServerConfig {
@@ -79,6 +92,9 @@ impl ServerConfig {
             api_keys_file: env::var("ZEROBOOT_API_KEYS_FILE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("api_keys.json")),
+            api_key_pepper_file: env::var("ZEROBOOT_API_KEY_PEPPER_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/etc/zeroboot/pepper")),
             trusted_proxies,
             limits: Limits {
                 max_request_body_bytes: usize_env("ZEROBOOT_MAX_REQUEST_BODY_BYTES", 256 * 1024),
@@ -108,6 +124,15 @@ impl ServerConfig {
             artifacts: ArtifactConfig {
                 require_template_hashes: bool_env("ZEROBOOT_REQUIRE_TEMPLATE_HASHES", auth_mode_prod),
                 allowed_firecracker_version: env::var("ZEROBOOT_ALLOWED_FIRECRACKER_VERSION").ok().filter(|s| !s.trim().is_empty()),
+                allowed_firecracker_binary_sha256: env::var("ZEROBOOT_ALLOWED_FC_BINARY_SHA256").ok().filter(|s| !s.trim().is_empty()),
+                release_channel: env::var("ZEROBOOT_RELEASE_CHANNEL").ok().filter(|s| !s.trim().is_empty()),
+                require_template_signatures: bool_env("ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES", auth_mode_prod),
+            },
+            pool: PoolConfig {
+                min_idle_per_lang: usize_env("ZEROBOOT_POOL_MIN_PER_LANG", 0),
+                max_idle_per_lang: usize_env("ZEROBOOT_POOL_MAX_PER_LANG", 4),
+                borrow_timeout_ms: u64_env("ZEROBOOT_POOL_BORROW_TIMEOUT_MS", 5000),
+                health_check_interval_secs: u64_env("ZEROBOOT_POOL_HEALTH_CHECK_INTERVAL_SECS", 30),
             },
         })
     }
@@ -141,6 +166,7 @@ mod tests {
         let cfg = ServerConfig {
             auth_mode: AuthMode::Dev,
             api_keys_file: PathBuf::from("api_keys.json"),
+            api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
             trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
             limits: Limits {
                 max_request_body_bytes: 1,
@@ -157,7 +183,19 @@ mod tests {
             health: HealthConfig { probe_timeout_secs: 1, cache_ttl_secs: 1 },
             bind_addr: "127.0.0.1".into(),
             queue: QueueConfig { wait_timeout_ms: 1 },
-            artifacts: ArtifactConfig { require_template_hashes: false, allowed_firecracker_version: None },
+            artifacts: ArtifactConfig { 
+                require_template_hashes: false, 
+                allowed_firecracker_version: None,
+                allowed_firecracker_binary_sha256: None,
+                release_channel: None,
+                require_template_signatures: false,
+            },
+            pool: PoolConfig {
+                min_idle_per_lang: 0,
+                max_idle_per_lang: 4,
+                borrow_timeout_ms: 5000,
+                health_check_interval_secs: 30,
+            },
         };
         assert!(cfg.is_trusted_proxy("127.0.0.1".parse().unwrap()));
         assert!(!cfg.is_trusted_proxy("10.0.0.1".parse().unwrap()));

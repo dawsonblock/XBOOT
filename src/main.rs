@@ -1,7 +1,9 @@
 mod vmm;
 mod api;
+mod auth;
 mod config;
 mod protocol;
+mod signing;
 mod template_manifest;
 
 use anyhow::{bail, Result};
@@ -17,6 +19,7 @@ use api::handlers::{
 };
 use config::{AuthMode, ServerConfig};
 use protocol::GuestRequest;
+use template_manifest::{VerificationMode, verify_template_artifacts};
 use vmm::firecracker;
 use vmm::kvm::{create_snapshot_memfd, ForkedVm, VmSnapshot};
 use vmm::vmstate;
@@ -45,19 +48,54 @@ fn validate_snapshot_workdir(workdir: &str, expected_language: Option<&str>, con
     let require_hashes = config.map(|cfg| cfg.artifacts.require_template_hashes).unwrap_or(false);
     let allowed_firecracker_version = config
         .and_then(|cfg| cfg.artifacts.allowed_firecracker_version.as_deref());
-    template_manifest::verify_template_artifacts(
+    let allowed_firecracker_binary_sha256 = config
+        .and_then(|cfg| cfg.artifacts.allowed_firecracker_binary_sha256.as_deref());
+    let mode = config
+        .map(|cfg| if matches!(cfg.auth_mode, AuthMode::Prod) { VerificationMode::Prod } else { VerificationMode::Dev })
+        .unwrap_or(VerificationMode::Dev);
+    verify_template_artifacts(
         workdir_path,
         expected_language,
         allowed_firecracker_version,
+        allowed_firecracker_binary_sha256,
         require_hashes,
+        mode,
     )?;
     Ok(())
 }
 
 fn load_snapshot(workdir: &str, expected_language: Option<&str>, config: Option<&ServerConfig>) -> Result<(VmSnapshot, i32)> {
-    validate_snapshot_workdir(workdir, expected_language, config)?;
-    let mem_path = format!("{}/snapshot/mem", workdir);
-    let state_path = format!("{}/snapshot/vmstate", workdir);
+    // First validate and get the manifest to know the actual paths
+    let workdir_path = Path::new(workdir);
+    let require_hashes = config.map(|cfg| cfg.artifacts.require_template_hashes).unwrap_or(false);
+    let allowed_firecracker_version = config
+        .and_then(|cfg| cfg.artifacts.allowed_firecracker_version.as_deref());
+    let allowed_firecracker_binary_sha256 = config
+        .and_then(|cfg| cfg.artifacts.allowed_firecracker_binary_sha256.as_deref());
+    let mode = config
+        .map(|cfg| if matches!(cfg.auth_mode, AuthMode::Prod) { VerificationMode::Prod } else { VerificationMode::Dev })
+        .unwrap_or(VerificationMode::Dev);
+    
+    let manifest = verify_template_artifacts(
+        workdir_path,
+        expected_language,
+        allowed_firecracker_version,
+        allowed_firecracker_binary_sha256,
+        require_hashes,
+        mode,
+    )?;
+    
+    // Use paths from manifest, resolved with confinement in prod mode
+    let (mem_path, state_path) = if mode == VerificationMode::Prod {
+        let mem = template_manifest::resolve_path_confined(workdir_path, &manifest.snapshot_mem_path)?;
+        let state = template_manifest::resolve_path_confined(workdir_path, &manifest.snapshot_state_path)?;
+        (mem, state)
+    } else {
+        (
+            template_manifest::resolve_path(workdir_path, &manifest.snapshot_mem_path),
+            template_manifest::resolve_path(workdir_path, &manifest.snapshot_state_path),
+        )
+    };
 
     eprintln!("Loading snapshot from {}...", workdir);
     let mem_data = std::fs::read(&mem_path)?;
@@ -292,6 +330,14 @@ fn cmd_serve(args: &[String]) -> Result<()> {
                 template_statuses.insert(lang, api::handlers::TemplateStatus { ready: false, detail: format!("quarantined: {}", e) });
             }
         }
+    }
+
+    // In Prod mode, fail hard if any template is quarantined - no partial activation
+    if matches!(config.auth_mode, AuthMode::Prod) && quarantined > 0 {
+        bail!(
+            "prod mode requires all templates to be valid, but {} template(s) quarantined",
+            quarantined
+        );
     }
 
     let api_keys = load_api_keys(&config)?;

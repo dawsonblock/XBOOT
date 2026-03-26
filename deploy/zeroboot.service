@@ -31,5 +31,15 @@ TasksMax=1024
 MemoryHigh=2G
 MemoryMax=3G
 
+# Security hardening - be careful with anything that breaks KVM access
+DeviceAllow=/dev/kvm rw
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+SystemCallArchitectures=native
+
 [Install]
 WantedBy=multi-user.target

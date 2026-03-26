@@ -25,3 +25,77 @@ jobs:
         run: python -m unittest discover -s tests -p 'test_*.py'
       - name: cargo tests
         run: cargo test --locked
+
+  # Verify template manifests before merge - ensures only properly formed templates are accepted
+  artifact-verify:
+    runs-on: ubuntu-latest
+    needs: sanity
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find template manifests
+        run: find manifests -name '*.json' -type f
+      - name: Validate manifest schema
+        run: |
+          for manifest in manifests/*.json; do
+            if [ -f "$manifest" ]; then
+              echo "Validating $manifest..."
+              python3 -c "
+                import json
+                import sys
+                with open('$manifest') as f:
+                    data = json.load(f)
+                    # Check required fields
+                    required = ['schema_version', 'template_id', 'promotion_channel', 'language']
+                    for field in required:
+                        if field not in data:
+                            print(f'ERROR: $manifest missing required field: {field}')
+                            sys.exit(1)
+                    # In prod, verify promotion state
+                    if data.get('promotion_channel') == 'prod':
+                        if not data.get('manifest_signature'):
+                            print(f'ERROR: prod template $manifest missing signature')
+                            sys.exit(1)
+                    print(f'OK: $manifest')
+              "
+            fi
+          done
+
+  # Real KVM smoke test - proves Firecracker boot/restore/exec on actual hardware
+  kvm-smoke:
+    runs-on: [self-hosted, linux, x64, kvm]
+    needs: sanity
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build zeroboot
+        run: cargo build --locked --release
+      - name: Verify Firecracker exists
+        run: |
+          command -v firecracker
+          firecracker --version
+      - name: Build guest assets
+        run: |
+          bash scripts/build_guest_rootfs.sh
+          bash scripts/build_rootfs_image.sh
+      - name: Create Python template
+        run: |
+          mkdir -p /tmp/zb-python
+          ./target/release/zeroboot template guest/vmlinux-fc guest/rootfs-python.ext4 /tmp/zb-python 20 /init 512
+      - name: Smoke exec Python
+        run: |
+          ./target/release/zeroboot test-exec /tmp/zb-python python "print(1+1)"
+      - name: Start API
+        run: |
+          ./target/release/zeroboot serve python:/tmp/zb-python 8080 > /tmp/zeroboot.log 2>&1 &
+          echo $! > /tmp/zeroboot.pid
+          sleep 3
+          curl -fsS http://127.0.0.1:8080/ready
+          curl -fsS http://127.0.0.1:8080/health
+          curl -fsS -X POST http://127.0.0.1:8080/v1/exec \
+            -H 'content-type: application/json' \
+            -d '{"language":"python","code":"print(40+2)","timeout_seconds":5}'
+      - name: Stop API
+        if: always()
+        run: |
+          kill "$(cat /tmp/zeroboot.pid)" || true

@@ -1,6 +1,10 @@
 use anyhow::{Result, bail};
 use kvm_bindings::*;
 
+// Known vmstate format version - must match Firecracker version
+// Change this when upgrading Firecracker to force vmstate format validation
+pub const EXPECTED_VMSTATE_VERSION: &str = "1.12.0";
+
 // Reference offsets for Firecracker v1.12.0, 1 vCPU, x86_64.
 // These are the known offsets for ONE specific vmstate layout.
 // The actual offsets may shift due to variable-length versionize sections,
@@ -16,6 +20,27 @@ const REF_EFER: usize = 0x2AF5;
 const REF_APIC_BASE: usize = 0x2AFD;
 const REF_XCRS: usize = 0x2B75;
 const REF_XSAVE: usize = 0x2D0D;
+
+/// Validate that the provided Firecracker version matches expected.
+/// In prod mode, reject vmstate if Firecracker version is unknown or mismatched.
+pub fn validate_vmstate_compatibility(firecracker_version: Option<&str>) -> Result<()> {
+    let fc_version = firecracker_version.unwrap_or("");
+    
+    // If no version info, warn but allow in dev mode
+    if fc_version.is_empty() {
+        bail!("cannot verify vmstate compatibility: Firecracker version unknown");
+    }
+    
+    // Strict version check - parser is tied to specific Firecracker version
+    if fc_version != EXPECTED_VMSTATE_VERSION {
+        bail!(
+            "vmstate format mismatch: parser is for v{} but Firecracker is v{}. Upgrade vmstate parser or use compatible Firecracker.",
+            EXPECTED_VMSTATE_VERSION, fc_version
+        );
+    }
+    
+    Ok(())
+}
 
 pub struct ParsedVmState {
     pub regs: kvm_regs,
