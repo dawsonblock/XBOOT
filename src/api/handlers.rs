@@ -70,6 +70,8 @@ pub struct BatchResponse {
 pub struct HealthResponse {
     pub status: String,
     pub templates: HashMap<String, TemplateStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -615,12 +617,20 @@ pub async fn batch_handler(
 
     let client_ip = extract_client_ip(&state, &headers, addr);
     let masked_key = mask_api_key(&api_key);
-    let mut tasks = Vec::with_capacity(req.executions.len());
-    for (index, exec_req) in req.executions.into_iter().enumerate() {
-        let permit = match acquire_permit(&state).await {
-            Ok(p) => p,
+    
+    // Acquire ALL permits upfront before spawning any tasks (atomic batch)
+    let mut permits = Vec::with_capacity(req.executions.len());
+    for _ in 0..req.executions.len() {
+        match acquire_permit(&state).await {
+            Ok(p) => permits.push(p),
             Err(e) => return e.into_response(),
         };
+    }
+    
+    // Now spawn all tasks - we have all permits
+    let mut tasks = Vec::with_capacity(req.executions.len());
+    for (index, exec_req) in req.executions.into_iter().enumerate() {
+        let permit = permits.remove(0);
         let state_for_task = state.clone();
         let request_id = uuid::Uuid::now_v7().to_string();
         let rid = request_id.clone();
@@ -669,6 +679,7 @@ fn static_ready_state(state: &AppState) -> HealthResponse {
     HealthResponse {
         status: if all_ready { "ok".into() } else { "degraded".into() },
         templates,
+        error: None,
     }
 }
 
@@ -692,10 +703,16 @@ fn probe_all_templates(state: &AppState) -> HealthResponse {
             detail: if ready { "probe ok".into() } else { probe.stderr },
         });
     }
-    HealthResponse { status: if all_ready { "ok".into() } else { "degraded".into() }, templates }
+    HealthResponse { status: if all_ready { "ok".into() } else { "degraded".into() }, templates, error: None }
 }
 
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    // Health probes must acquire a permit to avoid starving user requests
+    let permit = match acquire_permit(&state).await {
+        Ok(p) => p,
+        Err((status, json)) => return Json(HealthResponse { status: "unavailable".into(), templates: Default::default(), error: Some(format!("{:?} {}", status, json.0.error)) }),
+    };
+    
     let ttl = Duration::from_secs(state.config.health.cache_ttl_secs.max(1));
     if let Some(cached) = state.health_cache.lock().unwrap().clone() {
         if cached.generated_at.elapsed() < ttl {
@@ -704,7 +721,10 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthRe
     }
 
     let state_for_task = state.clone();
-    let response = tokio::task::spawn_blocking(move || probe_all_templates(&state_for_task)).await.unwrap();
+    let response = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        probe_all_templates(&state_for_task)
+    }).await.unwrap();
     *state.health_cache.lock().unwrap() = Some(CachedHealthState {
         generated_at: Instant::now(),
         response: response.clone(),

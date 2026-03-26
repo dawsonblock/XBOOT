@@ -93,26 +93,26 @@ impl FirecrackerVm {
     }
 
     pub fn wait_for_guest_ready(&mut self, timeout: Duration) -> Result<()> {
-        let stdout = self.process.stdout.as_mut().context("Firecracker stdout pipe unavailable")?;
-        let _reader = BufReader::new(stdout);
         let start = Instant::now();
-        let mut line = String::new();
+        let mut line = String::with_capacity(256);
+        
         loop {
+            // Check if process exited FIRST (before any borrow)
+            if let Ok(Some(status)) = self.process.try_wait() {
+                bail!("Firecracker exited before guest became ready: {}", status);
+            }
+            
             if start.elapsed() > timeout {
                 let stderr_tail = self.read_stderr_tail();
                 bail!("guest readiness handshake timed out after {:?}: {}", timeout, stderr_tail);
             }
+            
+            // Create BufReader for this iteration - less efficient but correct
+            let stdout = self.process.stdout.as_mut().context("Firecracker stdout pipe unavailable")?;
+            let mut reader = BufReader::new(stdout);
+            
             line.clear();
-            let read_result = {
-                let stdout = self.process.stdout.as_mut().context("Firecracker stdout pipe unavailable")?;
-                let mut temp_reader = BufReader::new(stdout);
-                temp_reader.read_line(&mut line)
-            };
-            // Check if process exited
-            if let Ok(Some(status)) = self.process.try_wait() {
-                bail!("Firecracker exited before guest became ready: {}", status);
-            }
-            match read_result {
+            match reader.read_line(&mut line) {
                 Ok(0) => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
