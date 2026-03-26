@@ -1,0 +1,6 @@
+{
+  "firecracker_version": "REQUIRED",
+  "kernel_version": "REQUIRED",
+  "kernel_sha256": "REQUIRED",
+  "arch": "x86_64"
+}

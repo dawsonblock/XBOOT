@@ -1,0 +1,11 @@
+{
+  "language": "node",
+  "base_rootfs": "REQUIRED",
+  "base_rootfs_sha256": "REQUIRED",
+  "runtime_binary": "/usr/bin/node",
+  "runtime_version": "REQUIRED",
+  "worker": "/zeroboot/worker_node.js",
+  "protocol_version": "ZB1",
+  "mem_size_mib": 512,
+  "vcpu_count": 1
+}

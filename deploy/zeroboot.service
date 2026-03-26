@@ -1,0 +1,35 @@
+[Unit]
+Description=Zeroboot Sandbox Engine
+After=network.target
+Documentation=https://github.com/zeroboot/zeroboot
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=zeroboot
+Group=kvm
+WorkingDirectory=/var/lib/zeroboot
+EnvironmentFile=-/etc/zeroboot/zeroboot.env
+ExecStart=/usr/local/bin/zeroboot serve "python:/var/lib/zeroboot/templates/python,node:/var/lib/zeroboot/templates/node" 8080
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+Environment=ZEROBOOT_AUTH_MODE=prod
+Environment=ZEROBOOT_API_KEYS_FILE=/etc/zeroboot/api_keys.json
+Environment=ZEROBOOT_REQUEST_LOG_PATH=/var/lib/zeroboot/requests.jsonl
+Environment=ZEROBOOT_LOG_CODE=false
+Environment=ZEROBOOT_TRUSTED_PROXIES=
+Environment=ZEROBOOT_HEALTH_CACHE_TTL_SECS=10
+Environment=ZEROBOOT_REQUIRE_TEMPLATE_HASHES=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ProtectSystem=strict
+ReadWritePaths=/var/lib/zeroboot /etc/zeroboot /var/log/zeroboot
+PrivateTmp=true
+NoNewPrivileges=true
+TasksMax=1024
+MemoryHigh=2G
+MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target
