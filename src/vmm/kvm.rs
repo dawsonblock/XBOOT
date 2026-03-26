@@ -151,8 +151,11 @@ impl ForkedVm {
         }
 
         // Restore XSAVE (FPU/SSE/AVX state — must be after XCRS)
-        vcpu_fd.set_xsave(&snapshot.xsave)
-            .map_err(|e| anyhow::anyhow!("set_xsave: {}", e))?;
+        // SAFETY: Restoring xsave state from a previously saved valid VM state
+        unsafe {
+            vcpu_fd.set_xsave(&snapshot.xsave)
+                .map_err(|e| anyhow::anyhow!("set_xsave: {}", e))?;
+        }
 
         vcpu_fd.set_regs(&snapshot.regs)?;
 
