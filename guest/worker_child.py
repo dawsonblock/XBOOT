@@ -72,10 +72,6 @@ def main():
         exit_code = 1
         error_type = "runtime"
         traceback.print_exc(file=stderr_io)
-    except Exception as e:
-        exit_code = 1
-        error_type = "runtime"
-        stderr_io.write(f"unexpected error: {e}\n")
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         sys.stdin = old_stdin
