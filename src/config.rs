@@ -210,8 +210,8 @@ impl ServerConfig {
         let keyring_path = self.artifacts.keyring_path.as_ref().ok_or_else(|| {
             anyhow::anyhow!("prod mode requires ZEROBOOT_KEYRING_PATH to be set")
         })?;
-        if !keyring_path.exists() {
-            bail!("prod mode requires ZEROBOOT_KEYRING_PATH file to exist: {}", keyring_path.display());
+        if !keyring_path.is_file() {
+            bail!("prod mode requires ZEROBOOT_KEYRING_PATH to be a file: {}", keyring_path.display());
         }
 
         // Validate allowed firecracker version is set
