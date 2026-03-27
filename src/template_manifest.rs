@@ -606,3 +606,91 @@ mod tests {
         assert!(result.is_ok(), "valid prod manifest should pass: {:?}", result);
     }
 }
+
+#[cfg(test)]
+mod strict_enforcement_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_prod_rejects_missing_template_id() {
+        let tmp = TempDir::new().unwrap();
+        let workdir = tmp.path();
+        
+        // Create manifest with missing template_id
+        let mut manifest = TemplateManifest::default();
+        manifest.schema_version = Some(1);
+        manifest.promotion_channel = Some("prod".to_string());
+        manifest.template_id = None; // Missing in prod
+        
+        let path = workdir.join("template.manifest.json");
+        let f = std::fs::File::create(&path).unwrap();
+        serde_json::to_writer(f, &manifest).unwrap();
+        
+        // Also need snapshot files for verification to proceed
+        std::fs::write(workdir.join("snapshot.state"), "test").unwrap();
+        std::fs::write(workdir.join("snapshot.mem"), "test").unwrap();
+        
+        let policy = ManifestPolicy::prod();
+        let result = verify_template_artifacts_with_policy(workdir, &policy);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("template_id"), "expected template_id error: {}", err);
+    }
+
+    #[test]
+    fn test_prod_rejects_path_escape() {
+        let tmp = TempDir::new().unwrap();
+        let workdir = tmp.path();
+        
+        // Create manifest with path escape attempt
+        let mut manifest = TemplateManifest::default();
+        manifest.schema_version = Some(1);
+        manifest.promotion_channel = Some("prod".to_string());
+        manifest.template_id = Some("test".to_string());
+        manifest.snapshot_state_path = "../../../etc/passwd".to_string();
+        manifest.snapshot_mem_path = "mem".to_string();
+        manifest.snapshot_state_bytes = 4;
+        manifest.snapshot_mem_bytes = 4;
+        
+        let path = workdir.join("template.manifest.json");
+        let f = std::fs::File::create(&path).unwrap();
+        serde_json::to_writer(f, &manifest).unwrap();
+        
+        // Create dummy files
+        std::fs::write(workdir.join("mem"), "test").unwrap();
+        
+        let policy = ManifestPolicy::prod();
+        let result = verify_template_artifacts_with_policy(workdir, &policy);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("confined") || err.contains("outside"), "expected path escape error: {}", err);
+    }
+
+    #[test]
+    fn test_prod_rejects_unsupported_schema_version() {
+        let tmp = TempDir::new().unwrap();
+        let workdir = tmp.path();
+        
+        // Create manifest with unsupported schema version
+        let mut manifest = TemplateManifest::default();
+        manifest.schema_version = Some(99); // Unsupported
+        manifest.promotion_channel = Some("prod".to_string());
+        manifest.template_id = Some("test".to_string());
+        
+        let path = workdir.join("template.manifest.json");
+        let f = std::fs::File::create(&path).unwrap();
+        serde_json::to_writer(f, &manifest).unwrap();
+        
+        // Also need snapshot files
+        std::fs::write(workdir.join("snapshot.state"), "test").unwrap();
+        std::fs::write(workdir.join("snapshot.mem"), "test").unwrap();
+        
+        let policy = ManifestPolicy::prod();
+        let result = verify_template_artifacts_with_policy(workdir, &policy);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("schema_version"), "expected schema_version error: {}", err);
+    }
+}

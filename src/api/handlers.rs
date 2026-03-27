@@ -88,10 +88,30 @@ pub struct HealthResponse {
     pub error: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
+/// Template health status categories for detailed diagnostics
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub enum TemplateHealth {
+    /// Template is healthy and ready to serve requests
+    Healthy,
+    /// Template failed startup verification (missing fields, invalid signatures, etc.)
+    QuarantinedTrust,
+    /// Template failed runtime health check
+    QuarantinedHealth,
+    /// Template version incompatible with current Firecracker
+    UnsupportedVersion,
+}
+
+impl Default for TemplateHealth {
+    fn default() -> Self {
+        TemplateHealth::Healthy
+    }
+}
+
 pub struct TemplateStatus {
     pub ready: bool,
     pub detail: String,
+    #[serde(default)]
+    pub health: TemplateHealth,
 }
 
 #[derive(Serialize)]
@@ -1016,6 +1036,18 @@ fn probe_all_templates(state: &AppState) -> HealthResponse {
                 .fetch_add(1, Ordering::Relaxed);
             all_ready = false;
         }
+        let health = if ready {
+            TemplateHealth::Healthy
+        } else {
+            // Check if it was a trust-related failure during startup
+            if startup_errors.iter().any(|e| e.contains("verify") || e.contains("signature") || e.contains("hash")) {
+                TemplateHealth::QuarantinedTrust
+            } else if startup_errors.iter().any(|e| e.contains("version") || e.contains("firecracker")) {
+                TemplateHealth::UnsupportedVersion
+            } else {
+                TemplateHealth::QuarantinedHealth
+            }
+        };
         templates.insert(
             name.clone(),
             TemplateStatus {
@@ -1025,6 +1057,7 @@ fn probe_all_templates(state: &AppState) -> HealthResponse {
                 } else {
                     probe.stderr
                 },
+                health,
             },
         );
     }
