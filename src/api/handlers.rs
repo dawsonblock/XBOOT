@@ -1040,9 +1040,10 @@ fn probe_all_templates(state: &AppState) -> HealthResponse {
             TemplateHealth::Healthy
         } else {
             // Check if it was a trust-related failure during startup
-            if startup_errors.iter().any(|e| e.contains("verify") || e.contains("signature") || e.contains("hash")) {
+            let detail = startup_status.detail.to_lowercase();
+            if detail.contains("verify") || detail.contains("signature") || detail.contains("hash") {
                 TemplateHealth::QuarantinedTrust
-            } else if startup_errors.iter().any(|e| e.contains("version") || e.contains("firecracker")) {
+            } else if detail.contains("version") || detail.contains("firecracker") {
                 TemplateHealth::UnsupportedVersion
             } else {
                 TemplateHealth::QuarantinedHealth
