@@ -104,7 +104,7 @@ fn load_snapshot(
 
     let state_data = std::fs::read(&state_path)?;
 
-    // Pre-restore validation: verify vmstate before KVM mutation (Commit 11)
+    // Pre-restore validation: verify vmstate before any KVM mutation
     // This is the first line of defense against corrupt/mismatched snapshots
     let firecracker_version = config
         .and_then(|c| c.artifacts.allowed_firecracker_version.as_deref());
