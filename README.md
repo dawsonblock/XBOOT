@@ -70,7 +70,7 @@ The guest execution model provides strong isolation between requests:
 
 This subprocess-based model ensures:
 - No persistent Python/Node.js state between requests
-- Fresh filesystem namespace per request
+- Per-request scratch filesystem area with no persistent on-disk state between requests
 - Memory isolation between executions
 - Automatic cleanup on timeout or error
 
