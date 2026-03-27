@@ -30,9 +30,49 @@ XBOOT is a **production-ready** VM sandbox system that provides sub-millisecond 
 
 - **Snapshot-based KVM restore** with copy-on-write memory mapping
 - **Framed host↔guest protocol** with length-prefixed frames and FNV-1a checksums
-- **Persistent language workers** (Python & Node.js) in the guest
+- **Per-request guest workers** (Python & Node.js) with subprocess isolation
 - **Production-grade security** including hashed API keys, template signing, and systemd confinement
 - **Versioned deployments** with automatic rollback
+
+### Production Mode Requirements
+
+In **Prod mode**, the server enforces strict security requirements:
+
+| Requirement | Description |
+|-------------|-------------|
+| Template Hashes | All artifact files must have SHA256 hashes in manifest |
+| Template Signatures | Manifest must be signed by a trusted key |
+| Release Channel | Template must be promoted to configured channel (default: "prod") |
+| Schema Version | Template must declare schema_version (only v1 supported) |
+| Firecracker Version | Template must specify version (when pinned in config) |
+| Path Confinement | All artifact paths must stay within workdir |
+| API Key Pepper | Pepper secret must exist |
+| No Code Logging | `ZEROBOOT_LOG_CODE` must be false |
+
+**Startup Fail-Closed**: In prod mode, the server will refuse to start if:
+- `ZEROBOOT_REQUIRE_TEMPLATE_HASHES` is not set to true
+- `ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES` is not set to true
+- `ZEROBOOT_KEYRING_PATH` is not set or file doesn't exist
+- `ZEROBOOT_ALLOWED_FIRECRACKER_VERSION` is not set
+- `ZEROBOOT_ALLOWED_FC_BINARY_SHA256` is not set
+- `ZEROBOOT_RELEASE_CHANNEL` is not set
+- `ZEROBOOT_API_KEYS_FILE` doesn't exist
+- `ZEROBOOT_API_KEY_PEPPER_FILE` doesn't exist
+- `logging.log_code` is true
+
+### Guest Isolation Model
+
+The guest execution model provides strong isolation between requests:
+
+1. **Supervisor Process**: A long-lived process that manages request queuing
+2. **Child Executor**: For each request, a fresh child process is spawned to execute code
+3. **Process Exit**: The child process exits after each request, ensuring no state bleeds
+
+This subprocess-based model ensures:
+- No persistent Python/Node.js state between requests
+- Fresh filesystem namespace per request
+- Memory isolation between executions
+- Automatic cleanup on timeout or error
 
 ### Key Features
 

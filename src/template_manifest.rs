@@ -17,6 +17,69 @@ pub enum VerificationMode {
     Prod,
 }
 
+/// Centralized manifest verification policy.
+/// This struct centralizes all verification parameters to avoid rebuilding
+/// verification flags ad hoc throughout the codebase.
+#[derive(Debug, Clone)]
+pub struct ManifestPolicy<'a> {
+    pub mode: VerificationMode,
+    pub expected_language: Option<&'a str>,
+    pub expected_release_channel: Option<&'a str>,
+    pub allowed_firecracker_version: Option<&'a str>,
+    pub allowed_firecracker_binary_sha256: Option<&'a str>,
+    pub require_hashes: bool,
+    pub require_signatures: bool,
+    pub keyring_path: Option<&'a Path>,
+}
+
+impl<'a> ManifestPolicy<'a> {
+    pub fn from_config(
+        config: &'a crate::config::ServerConfig,
+    ) -> Self {
+        Self {
+            mode: config.verification_mode(),
+            expected_language: None,
+            expected_release_channel: config.expected_release_channel(),
+            allowed_firecracker_version: config.artifacts.allowed_firecracker_version.as_deref(),
+            allowed_firecracker_binary_sha256: config.artifacts.allowed_firecracker_binary_sha256.as_deref(),
+            require_hashes: config.artifacts.require_template_hashes,
+            require_signatures: config.artifacts.require_template_signatures,
+            keyring_path: config.artifacts.keyring_path.as_deref(),
+        }
+    }
+
+    pub fn dev() -> Self {
+        Self {
+            mode: VerificationMode::Dev,
+            expected_language: None,
+            expected_release_channel: None,
+            allowed_firecracker_version: None,
+            allowed_firecracker_binary_sha256: None,
+            require_hashes: false,
+            require_signatures: false,
+            keyring_path: None,
+        }
+    }
+
+    pub fn prod(
+        expected_release_channel: &'a str,
+        allowed_firecracker_version: &'a str,
+        allowed_firecracker_binary_sha256: &'a str,
+        keyring_path: &'a Path,
+    ) -> Self {
+        Self {
+            mode: VerificationMode::Prod,
+            expected_language: None,
+            expected_release_channel: Some(expected_release_channel),
+            allowed_firecracker_version: Some(allowed_firecracker_version),
+            allowed_firecracker_binary_sha256: Some(allowed_firecracker_binary_sha256),
+            require_hashes: true,
+            require_signatures: true,
+            keyring_path: Some(keyring_path),
+        }
+    }
+}
+
 /// Extended TemplateManifest with trust fields for production use
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TemplateManifest {
@@ -185,27 +248,80 @@ pub fn verify_template_artifacts(
     mode: VerificationMode,
     keyring_path: Option<&Path>,
 ) -> Result<TemplateManifest> {
+    // Build a temporary policy from individual parameters
+    let policy = ManifestPolicy {
+        mode,
+        expected_language,
+        expected_release_channel: None, // Not passed in this signature
+        allowed_firecracker_version,
+        allowed_firecracker_binary_sha256,
+        require_hashes,
+        require_signatures,
+        keyring_path,
+    };
+    verify_template_artifacts_with_policy(workdir, &policy)
+}
+
+
+/// Verify template artifacts using a ManifestPolicy.
+/// This is the preferred API - it centralizes all verification parameters.
+pub fn verify_template_artifacts_with_policy(
+    workdir: &Path,
+    policy: &ManifestPolicy,
+) -> Result<TemplateManifest> {
     let manifest = read_manifest(workdir)?;
+    let mode = policy.mode;
 
     // === PRODUCTION MODE ENFORCEMENT ===
     if mode == VerificationMode::Prod {
-        // 1. Require schema_version
-        if manifest.schema_version.is_none() {
-            bail!("template manifest missing schema_version in prod mode");
+        // 1. Require schema_version and check supported version
+        match manifest.schema_version {
+            Some(1) => {} // Version 1 is supported
+            Some(unsupported) => {
+                bail!("unsupported schema_version in prod mode: {}, only version 1 is supported", unsupported);
+            }
+            None => {
+                bail!("template manifest missing schema_version in prod mode");
+            }
         }
 
-        // 2. Require promotion_channel = "prod"
+        // 2. Require promotion_channel to match expected release channel from policy
+        let expected_channel = policy.expected_release_channel.unwrap_or("prod");
         match manifest.promotion_channel.as_deref() {
-            Some("prod") => {}
-            Some(channel) => bail!(
-                "template not promoted to prod: promotion_channel is '{}', expected 'prod'",
-                channel
+            Some(actual) if actual == expected_channel => {}
+            Some(actual) => bail!(
+                "template not promoted to required channel: got '{}', expected '{}'",
+                actual, expected_channel
             ),
             None => bail!("template manifest missing promotion_channel in prod mode"),
         }
 
-        // 3. Require signatures if configured
-        if require_signatures {
+        // 3. Require all core identity fields
+        if manifest.template_id.is_none() {
+            bail!("template manifest missing template_id in prod mode");
+        }
+        if manifest.build_id.is_none() {
+            bail!("template manifest missing build_id in prod mode");
+        }
+        if manifest.artifact_set_id.is_none() {
+            bail!("template manifest missing artifact_set_id in prod mode");
+        }
+
+        // 4. Require language and protocol version
+        if manifest.language.is_none() {
+            bail!("template manifest missing language in prod mode");
+        }
+        if manifest.protocol_version.is_none() {
+            bail!("template manifest missing protocol_version in prod mode");
+        }
+
+        // 5. Require Firecracker version when pinned in policy
+        if policy.allowed_firecracker_version.is_some() && manifest.firecracker_version.is_none() {
+            bail!("template manifest missing firecracker_version in prod mode");
+        }
+
+        // 6. Require signatures if configured
+        if policy.require_signatures {
             if manifest.manifest_signature.is_none() {
                 bail!("prod mode requires template signatures but none present");
             }
@@ -220,7 +336,7 @@ pub fn verify_template_artifacts(
             let manifest_json = serde_json::to_string(&manifest)?;
 
             // Load keyring if path provided
-            let keyring = if let Some(path) = keyring_path {
+            let keyring = if let Some(path) = policy.keyring_path {
                 Some(signing::load_keyring(path)?)
             } else {
                 None
@@ -236,8 +352,8 @@ pub fn verify_template_artifacts(
             .map_err(|e| anyhow::anyhow!("signature verification failed: {}", e))?;
         }
 
-        // 4. Validate Firecracker binary hash if configured
-        if let Some(expected_fc_sha256) = allowed_firecracker_binary_sha256 {
+        // 7. Validate Firecracker binary hash if configured
+        if let Some(expected_fc_sha256) = policy.allowed_firecracker_binary_sha256 {
             match manifest.firecracker_binary_sha256.as_deref() {
                 Some(actual_sha256)
                     if actual_sha256.to_lowercase() == expected_fc_sha256.to_lowercase() => {}
@@ -253,7 +369,7 @@ pub fn verify_template_artifacts(
 
     // === EXISTING VALIDATION LOGIC ===
 
-    if let Some(expected) = expected_language {
+    if let Some(expected) = policy.expected_language {
         match manifest.language.as_deref() {
             Some(actual) if actual == expected => {}
             Some(actual) => bail!(
@@ -265,7 +381,7 @@ pub fn verify_template_artifacts(
         }
     }
 
-    if let Some(expected_fc) = allowed_firecracker_version {
+    if let Some(expected_fc) = policy.allowed_firecracker_version {
         match manifest.firecracker_version.as_deref() {
             Some(actual) if actual == expected_fc => {}
             Some(actual) => bail!(
@@ -285,7 +401,7 @@ pub fn verify_template_artifacts(
                 proto
             );
         }
-    } else if require_hashes {
+    } else if policy.require_hashes {
         bail!("template manifest missing protocol_version");
     }
 
@@ -330,13 +446,13 @@ pub fn verify_template_artifacts(
     verify_hash_if_present(
         &state_path,
         manifest.snapshot_state_sha256.as_deref(),
-        require_hashes,
+        policy.require_hashes,
         "snapshot state",
     )?;
     verify_hash_if_present(
         &mem_path,
         manifest.snapshot_mem_sha256.as_deref(),
-        require_hashes,
+        policy.require_hashes,
         "snapshot memory",
     )?;
 
@@ -350,7 +466,7 @@ pub fn verify_template_artifacts(
         verify_hash_if_present(
             &kernel_path,
             manifest.kernel_sha256.as_deref(),
-            require_hashes,
+            policy.require_hashes,
             "kernel",
         )?;
     }
@@ -364,7 +480,7 @@ pub fn verify_template_artifacts(
         verify_hash_if_present(
             &rootfs_path,
             manifest.rootfs_sha256.as_deref(),
-            require_hashes,
+            policy.require_hashes,
             "rootfs",
         )?;
     }
@@ -381,7 +497,7 @@ mod tests {
     fn create_test_manifest(
         workdir: &Path,
         promotion_channel: &str,
-        schema_version: Option<&str>,
+        schema_version: Option<u32>,
     ) -> Result<PathBuf> {
         let mut manifest = serde_json::json!({
             "promotion_channel": promotion_channel,
@@ -422,7 +538,7 @@ mod tests {
     #[test]
     fn test_prod_rejects_wrong_promotion_channel() {
         let td = TempDir::new().unwrap();
-        create_test_manifest(td.path(), "dev", Some("1.0")).unwrap();
+        create_test_manifest(td.path(), "dev", Some(1)).unwrap();
 
         let result = verify_template_artifacts(
             td.path(),
@@ -467,7 +583,7 @@ mod tests {
     #[test]
     fn test_prod_accepts_valid_manifest() {
         let td = TempDir::new().unwrap();
-        create_test_manifest(td.path(), "prod", Some("1.0")).unwrap();
+        create_test_manifest(td.path(), "prod", Some(1)).unwrap();
 
         // Create dummy files
         fs::write(td.path().join("vmlinux"), "kernel").unwrap();

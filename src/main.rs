@@ -19,7 +19,7 @@ use api::handlers::{
 };
 use config::{AuthMode, ServerConfig};
 use protocol::GuestRequest;
-use template_manifest::{verify_template_artifacts, VerificationMode};
+use template_manifest::{verify_template_artifacts, ManifestPolicy, VerificationMode};
 use vmm::firecracker;
 use vmm::kvm::{create_snapshot_memfd, ForkedVm, VmSnapshot};
 use vmm::vmstate;
@@ -47,44 +47,24 @@ fn main() -> Result<()> {
     }
 }
 
+/// Build a ManifestPolicy from optional config.
+/// This centralizes verification policy construction.
+fn manifest_policy(config: Option<&ServerConfig>) -> ManifestPolicy {
+    match config {
+        Some(cfg) => ManifestPolicy::from_config(cfg),
+        None => ManifestPolicy::dev(),
+    }
+}
+
 fn validate_snapshot_workdir(
     workdir: &str,
     expected_language: Option<&str>,
     config: Option<&ServerConfig>,
 ) -> Result<()> {
     let workdir_path = Path::new(workdir);
-    let require_hashes = config
-        .map(|cfg| cfg.artifacts.require_template_hashes)
-        .unwrap_or(false);
-    let allowed_firecracker_version =
-        config.and_then(|cfg| cfg.artifacts.allowed_firecracker_version.as_deref());
-    let allowed_firecracker_binary_sha256 =
-        config.and_then(|cfg| cfg.artifacts.allowed_firecracker_binary_sha256.as_deref());
-    let keyring_path = config
-        .and_then(|cfg| cfg.artifacts.keyring_path.as_ref())
-        .map(|p| p.as_path());
-    let require_signatures = config
-        .map(|cfg| cfg.artifacts.require_template_signatures)
-        .unwrap_or(false);
-    let mode = config
-        .map(|cfg| {
-            if matches!(cfg.auth_mode, AuthMode::Prod) {
-                VerificationMode::Prod
-            } else {
-                VerificationMode::Dev
-            }
-        })
-        .unwrap_or(VerificationMode::Dev);
-    verify_template_artifacts(
-        workdir_path,
-        expected_language,
-        allowed_firecracker_version,
-        allowed_firecracker_binary_sha256,
-        require_hashes,
-        require_signatures,
-        mode,
-        keyring_path,
-    )?;
+    let mut policy = manifest_policy(config);
+    policy.expected_language = expected_language;
+    template_manifest::verify_template_artifacts_with_policy(workdir_path, &policy)?;
     Ok(())
 }
 
@@ -95,42 +75,13 @@ fn load_snapshot(
 ) -> Result<(VmSnapshot, i32)> {
     // First validate and get the manifest to know the actual paths
     let workdir_path = Path::new(workdir);
-    let require_hashes = config
-        .map(|cfg| cfg.artifacts.require_template_hashes)
-        .unwrap_or(false);
-    let allowed_firecracker_version =
-        config.and_then(|cfg| cfg.artifacts.allowed_firecracker_version.as_deref());
-    let allowed_firecracker_binary_sha256 =
-        config.and_then(|cfg| cfg.artifacts.allowed_firecracker_binary_sha256.as_deref());
-    let keyring_path = config
-        .and_then(|cfg| cfg.artifacts.keyring_path.as_ref())
-        .map(|p| p.as_path());
-    let require_signatures = config
-        .map(|cfg| cfg.artifacts.require_template_signatures)
-        .unwrap_or(false);
-    let mode = config
-        .map(|cfg| {
-            if matches!(cfg.auth_mode, AuthMode::Prod) {
-                VerificationMode::Prod
-            } else {
-                VerificationMode::Dev
-            }
-        })
-        .unwrap_or(VerificationMode::Dev);
+    let mut policy = manifest_policy(config);
+    policy.expected_language = expected_language;
 
-    let manifest = verify_template_artifacts(
-        workdir_path,
-        expected_language,
-        allowed_firecracker_version,
-        allowed_firecracker_binary_sha256,
-        require_hashes,
-        require_signatures,
-        mode,
-        keyring_path,
-    )?;
+    let manifest = template_manifest::verify_template_artifacts_with_policy(workdir_path, &policy)?;
 
     // Use paths from manifest, resolved with confinement in prod mode
-    let (mem_path, state_path) = if mode == VerificationMode::Prod {
+    let (mem_path, state_path) = if policy.mode == VerificationMode::Prod {
         let mem =
             template_manifest::resolve_path_confined(workdir_path, &manifest.snapshot_mem_path)?;
         let state =
@@ -449,6 +400,9 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     let port: u16 = args.get(1).and_then(|p| p.parse().ok()).unwrap_or(8080);
     let config = ServerConfig::from_env()?;
 
+    // Validate startup configuration - fail-closed in prod mode
+    config.validate_startup()?;
+
     let mut templates = std::collections::HashMap::new();
     let mut template_statuses = std::collections::HashMap::new();
     let mut quarantined = 0u64;
@@ -689,12 +643,28 @@ fn cmd_sign(args: &[String]) -> Result<()> {
     let key_bytes = std::fs::read(key_path)?;
     let manifest_json = std::fs::read_to_string(manifest_path)?;
 
-    // Sign the core identity fields
+    // Sign all core identity and artifact fields for production use
     let signed_fields = [
+        "schema_version",
         "template_id",
         "build_id",
         "artifact_set_id",
         "promotion_channel",
+        "language",
+        "kernel_path",
+        "kernel_sha256",
+        "rootfs_path",
+        "rootfs_sha256",
+        "init_path",
+        "snapshot_state_path",
+        "snapshot_state_sha256",
+        "snapshot_mem_path",
+        "snapshot_mem_sha256",
+        "firecracker_version",
+        "firecracker_binary_sha256",
+        "protocol_version",
+        "vcpu_count",
+        "mem_size_mib",
     ];
     let (signature, _) = signing::sign_manifest(&key_bytes, &manifest_json, &signed_fields)?;
 
@@ -714,7 +684,7 @@ fn cmd_sign(args: &[String]) -> Result<()> {
 
     println!("Manifest signed with key ID: {}", key_id);
     println!("Signature: {}", signature);
-    println!("Signed fields: {:?}", signed_fields);
+    println!("Signed fields ({}): {:?}", signed_fields.len(), signed_fields);
 
     Ok(())
 }
