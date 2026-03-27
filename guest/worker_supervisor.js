@@ -107,30 +107,48 @@ function spawnChildExecutor(timeoutMs, code, stdinData) {
 }
 
 function parseChildResponse(data) {
-  const lines = data.toString('utf8').split('\n', 1);
-  if (!lines[0].startsWith('WRK1R ')) {
+  // Find the end of the header line in the raw buffer.
+  const newlineIndex = data.indexOf(0x0a); // '\n'
+  if (newlineIndex === -1) {
     return [-1, 'internal', Buffer.alloc(0), Buffer.from('invalid child response'), FLAG_STDERR_TRUNCATED];
   }
-  
-  const parts = lines[0].trim().split(/\s+/);
+
+  const header = data.subarray(0, newlineIndex).toString('utf8');
+  if (!header.startsWith('WRK1R ')) {
+    return [-1, 'internal', Buffer.alloc(0), Buffer.from('invalid child response'), FLAG_STDERR_TRUNCATED];
+  }
+
+  const parts = header.trim().split(/\s+/);
   if (parts.length < 7) {
     return [-1, 'internal', Buffer.alloc(0), Buffer.from('malformed child response'), FLAG_STDERR_TRUNCATED];
   }
-  
+
   const exitCode = parseInt(parts[2], 10);
   const errorType = parts[3];
   const stdoutLen = parseInt(parts[4], 10);
   const stderrLen = parseInt(parts[5], 10);
   const flags = parseInt(parts[6], 10);
-  
+
+  // Slice stdout and stderr directly from the raw buffer body based on lengths.
+  const bodyOffset = newlineIndex + 1;
+  const bodyLength = data.length - bodyOffset;
+
   let stdout = Buffer.alloc(0);
   let stderr = Buffer.alloc(0);
-  if (lines.length > 1) {
-    const remaining = Buffer.from(lines[1], 'utf8');
-    stdout = remaining.subarray(0, stdoutLen);
-    stderr = remaining.subarray(stdoutLen, stdoutLen + stderrLen);
+
+  if (bodyLength > 0 && (stdoutLen > 0 || stderrLen > 0)) {
+    const stdoutStart = bodyOffset;
+    const stdoutEnd = Math.min(data.length, stdoutStart + stdoutLen);
+    stdout = data.subarray(stdoutStart, stdoutEnd);
+
+    const stderrStart = stdoutStart + stdoutLen;
+    const stderrEnd = Math.min(data.length, stderrStart + stderrLen);
+    if (stderrStart < data.length && stderrLen > 0) {
+      stderr = data.subarray(stderrStart, stderrEnd);
+    } else {
+      stderr = Buffer.alloc(0);
+    }
   }
-  
   return [exitCode, errorType, stdout, stderr, flags];
 }
 
