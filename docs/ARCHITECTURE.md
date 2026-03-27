@@ -75,10 +75,10 @@ Node.js equivalent of the Python subprocess isolation model.
 - **Schema version**: Only schema v1 supported in prod mode
 
 ### Guest Isolation
-- **Subprocess model**: Each request spawns a fresh child process
-- **Process exit**: Child exits after each request, ensuring no state bleeds
-- **Fresh filesystem**: Each child gets a clean filesystem view
-- **Memory isolation**: Complete memory separation between requests
+- **Subprocess model**: Each request runs in a fresh child process inside the same guest VM
+- **Process exit**: Child exits after each request, minimizing in-memory state reuse
+- **Filesystem behavior**: All requests share the same guest filesystem; any per-request scratch or cleanup is handled in user space
+- **Process isolation**: Isolation between requests is provided by the OS process model within a single guest VM, not by separate VMs or mount/user namespaces
 
 ## Current boundaries
 
