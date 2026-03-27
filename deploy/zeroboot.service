@@ -34,7 +34,7 @@ TasksMax=1024
 MemoryHigh=2G
 MemoryMax=3G
 
-# Security hardening - be careful with anything that breaks KVM access
+# Security hardening - kept minimal to avoid breaking KVM
 DeviceAllow=/dev/kvm rw
 ProtectKernelTunables=true
 ProtectKernelModules=true
@@ -43,6 +43,13 @@ RestrictNamespaces=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
 SystemCallArchitectures=native
+
+# Additional hardening that doesn't break KVM
+UMask=0077
+ProtectHome=true
+RestrictSUIDSGID=true
+ProtectProc=invisible
+ProcSubset=pid
 
 [Install]
 WantedBy=multi-user.target

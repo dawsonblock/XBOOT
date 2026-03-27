@@ -27,7 +27,11 @@ export ZEROBOOT_MAX_CONCURRENT_REQUESTS=32
 export ZEROBOOT_TRUSTED_PROXIES=127.0.0.1
 export ZEROBOOT_HEALTH_CACHE_TTL_SECS=10
 export ZEROBOOT_REQUIRE_TEMPLATE_HASHES=true
-export ZEROBOOT_ALLOWED_FIRECRACKER_VERSION="firecracker v1.8.0"
+export ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=true
+export ZEROBOOT_KEYRING_PATH=/etc/zeroboot/keyring.json
+export ZEROBOOT_ALLOWED_FIRECRACKER_VERSION="1.12.0"
+export ZEROBOOT_ALLOWED_FC_BINARY_SHA256=<sha256-of-firecracker-binary>
+export ZEROBOOT_RELEASE_CHANNEL=prod
 ```
 
 ## Build flow
@@ -80,7 +84,34 @@ Generate API keys with `scripts/make_api_keys.py --output api_keys.json`.
 If `ZEROBOOT_WORKDIR` points at a template directory, `preflight.sh` also validates `template.manifest.json`.
 If `ZEROBOOT_ALLOWED_FIRECRACKER_VERSION` is set, `preflight.sh` rejects mismatched Firecracker binaries.
 
+## Production Mode Startup Verification
+
+In prod mode, the server enforces fail-closed startup. It will refuse to start if any of these are missing:
+
+- `ZEROBOOT_REQUIRE_TEMPLATE_HASHES=true`
+- `ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=true`  
+- `ZEROBOOT_KEYRING_PATH` (must be set and file must exist)
+- `ZEROBOOT_ALLOWED_FIRECRACKER_VERSION`
+- `ZEROBOOT_ALLOWED_FC_BINARY_SHA256`
+- `ZEROBOOT_RELEASE_CHANNEL`
+- `ZEROBOOT_API_KEYS_FILE` (file must exist)
+- `ZEROBOOT_API_KEY_PEPPER_FILE` (file must exist)
+- `logging.log_code=false` (code logging must be disabled)
+
+## Metrics
+
+The `/v1/metrics` endpoint exposes Prometheus metrics including:
+
+- `zeroboot_template_quarantines` - templates quarantined at startup
+- `zeroboot_manifest_verification_failures` - manifest validation failures
+- `zeroboot_signature_verification_failures` - signature check failures
+- `zeroboot_template_version_mismatches` - Firecracker version mismatches
+- `zeroboot_restore_failures` - VM restore failures
+- `zeroboot_worker_boot_failures` - worker boot failures
+- `zeroboot_worker_protocol_failures` - protocol errors
+
 ## Remaining gaps
 
 - no warm VM pool yet (experimental)
 - no live KVM/Firecracker CI lane yet
+- not proven for hostile public multitenancy

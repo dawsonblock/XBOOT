@@ -178,15 +178,8 @@ pub fn verify_manifest_signature(
         bail!("manifest_signed_fields is empty - nothing to verify");
     }
 
-    // Extract and canonicalize the signed content
-    let mut signed_content = String::new();
-    for field in &signed_fields {
-        if let Some(value) = manifest.get(field) {
-            let canonical =
-                serde_json::to_string(value).context(format!("canonicalize field '{}'", field))?;
-            signed_content.push_str(&canonical);
-        }
-    }
+    // Use canonical payload for verification
+    let payload = canonical_manifest_payload(&manifest, &signed_fields)?;
 
     // Decode the signature
     let signature_bytes =
@@ -219,7 +212,7 @@ pub fn verify_manifest_signature(
 
                 let public_key = UnparsedPublicKey::new(&ED25519, &key.public_key);
                 public_key
-                    .verify(signed_content.as_bytes(), &signature_bytes)
+                    .verify(&payload, &signature_bytes)
                     .map_err(|e| anyhow::anyhow!("signature verification failed: {:?}", e))?;
             }
             _ => {
@@ -288,26 +281,20 @@ pub fn sign_manifest(
     let key_pair = Ed25519KeyPair::from_pkcs8(key_pair_bytes)
         .map_err(|e| anyhow::anyhow!("invalid key pair: {:?}", e))?;
 
-    // Extract and canonicalize the signed content
+    // Parse manifest to get JSON value
     let manifest: serde_json::Value =
         serde_json::from_str(manifest_json).context("invalid manifest JSON")?;
 
-    let mut signed_content = String::new();
-    for field in signed_fields {
-        if let Some(value) = manifest.get(field) {
-            let canonical =
-                serde_json::to_string(value).context(format!("canonicalize field '{}'", field))?;
-            signed_content.push_str(&canonical);
-        }
-    }
+    // Use canonical payload for deterministic signing
+    let payload = canonical_manifest_payload(&manifest, signed_fields)?;
 
-    let signature = key_pair.sign(signed_content.as_bytes());
+    let signature = key_pair.sign(&payload);
     let signature_b64 = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
         signature.as_ref(),
     );
 
-    Ok((signature_b64, signed_content))
+    Ok((signature_b64, String::from_utf8_lossy(&payload).to_string()))
 }
 
 /// Get the public key ID from a key pair (SHA256 hash of public key)
@@ -327,6 +314,50 @@ pub fn sign_data(key_pair_bytes: &[u8], data: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| anyhow::anyhow!("invalid key pair: {:?}", e))?;
 
     Ok(key_pair.sign(data).as_ref().to_vec())
+}
+
+/// Create a canonical manifest payload for signing.
+///
+/// This function:
+/// - Sorts the signed_fields lexicographically
+/// - Builds a deterministic text payload: `field_name=<canonical-json>\n`
+/// - Rejects empty field list and duplicates
+///
+/// This ensures signatures are unambiguous regardless of field ordering in the manifest.
+pub fn canonical_manifest_payload(
+    manifest: &serde_json::Value,
+    signed_fields: &[&str],
+) -> Result<Vec<u8>> {
+    if signed_fields.is_empty() {
+        bail!("cannot create canonical payload: signed_fields is empty");
+    }
+
+    // Check for duplicates
+    let mut seen = std::collections::HashSet::new();
+    for field in signed_fields {
+        if !seen.insert(field) {
+            bail!("cannot create canonical payload: duplicate field '{}'", field);
+        }
+    }
+
+    // Sort fields lexicographically
+    let mut sorted_fields: Vec<&str> = signed_fields.to_vec();
+    sorted_fields.sort();
+
+    // Build deterministic payload: field_name=<canonical-json>\n
+    let mut payload = String::new();
+    for field in sorted_fields {
+        let value = manifest.get(field).ok_or_else(|| {
+            anyhow::anyhow!("canonical payload: manifest missing field '{}'", field)
+        })?;
+        let canonical = serde_json::to_string(value)?;
+        payload.push_str(field);
+        payload.push('=');
+        payload.push_str(&canonical);
+        payload.push('\n');
+    }
+
+    Ok(payload.into_bytes())
 }
 
 /// Format public key for keyring (base64)
@@ -385,5 +416,72 @@ mod tests {
 
         let parsed = parse_public_key_base64(&b64).unwrap();
         assert_eq!(parsed, pk);
+    }
+
+    #[test]
+    fn test_canonical_payload_empty_fields_fails() {
+        let manifest = serde_json::json!({"foo": "bar"});
+        let result = canonical_manifest_payload(&manifest, &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_canonical_payload_duplicate_fields_fails() {
+        let manifest = serde_json::json!({"foo": "bar"});
+        let result = canonical_manifest_payload(&manifest, &["foo", "foo"]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn test_canonical_payload_missing_field_fails() {
+        let manifest = serde_json::json!({"foo": "bar"});
+        let result = canonical_manifest_payload(&manifest, &["foo", "baz"]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("missing"));
+    }
+
+    #[test]
+    fn test_canonical_payload_deterministic() {
+        let manifest = serde_json::json!({
+            "template_id": "test-001",
+            "build_id": "build-001",
+            "artifact_set_id": "art-001"
+        });
+
+        // Sign with fields in different order - should produce same payload
+        let payload1 = canonical_manifest_payload(&manifest, &["template_id", "build_id", "artifact_set_id"]).unwrap();
+        let payload2 = canonical_manifest_payload(&manifest, &["artifact_set_id", "template_id", "build_id"]).unwrap();
+        let payload3 = canonical_manifest_payload(&manifest, &["build_id", "artifact_set_id", "template_id"]).unwrap();
+
+        assert_eq!(payload1, payload2);
+        assert_eq!(payload2, payload3);
+
+        // Verify the payload format
+        let payload_str = String::from_utf8_lossy(&payload1);
+        assert!(payload_str.contains("artifact_set_id="));
+        assert!(payload_str.contains("build_id="));
+        assert!(payload_str.contains("template_id="));
+        assert!(payload_str.contains('\n'));
+    }
+
+    #[test]
+    fn test_canonical_payload_sorted_order() {
+        let manifest = serde_json::json!({
+            "z_field": "z",
+            "a_field": "a",
+            "m_field": "m"
+        });
+
+        let payload = canonical_manifest_payload(&manifest, &["z_field", "a_field", "m_field"]).unwrap();
+        let payload_str = String::from_utf8_lossy(&payload);
+
+        // Should be sorted lexicographically
+        let a_pos = payload_str.find("a_field").unwrap();
+        let m_pos = payload_str.find("m_field").unwrap();
+        let z_pos = payload_str.find("z_field").unwrap();
+        assert!(a_pos < m_pos);
+        assert!(m_pos < z_pos);
     }
 }

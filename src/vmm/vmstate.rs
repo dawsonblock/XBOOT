@@ -1,10 +1,84 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use kvm_bindings::*;
 
 // Known vmstate format version - must match Firecracker version
 // Change this when upgrading Firecracker to force vmstate format validation
 #[allow(dead_code)]
 pub const EXPECTED_VMSTATE_VERSION: &str = "1.12.0";
+
+/// Pre-restore validation errors
+#[derive(Debug, Clone)]
+pub enum VmstateValidationError {
+    UnsupportedVersion(String),
+    CorruptData(String),
+    InvalidCpuid(String),
+    InvalidMsrSet(String),
+    MemoryMapReject(String),
+}
+
+/// Validate vmstate before restoring to the VM.
+/// This is the first line of defense against corrupt/mismatched snapshots.
+pub fn pre_restore_validate(
+    data: &[u8],
+    firecracker_version: Option<&str>,
+    expected_vcpu_count: Option<u32>,
+) -> Result<(), VmstateValidationError> {
+    // 1. Version compatibility check
+    if let Some(fc_version) = firecracker_version {
+        if fc_version != EXPECTED_VMSTATE_VERSION {
+            return Err(VmstateValidationError::UnsupportedVersion(format!(
+                "vmstate format mismatch: parser is for v{} but Firecracker is v{}",
+                EXPECTED_VMSTATE_VERSION, fc_version
+            )));
+        }
+    } else {
+        return Err(VmstateValidationError::UnsupportedVersion(
+            "cannot verify vmstate compatibility: Firecracker version unknown".to_string()
+        ));
+    }
+
+    // 2. Basic sanity checks on vmstate data
+    if data.len() < 4096 {
+        return Err(VmstateValidationError::CorruptData(format!(
+            "vmstate too small: {} bytes (minimum expected ~4KB)",
+            data.len()
+        )));
+    }
+
+    // 3. Verify we can detect the offset shift (IOAPIC base address must be present)
+    if detect_offset_shift(data).is_err() {
+        return Err(VmstateValidationError::CorruptData(
+            "cannot detect vmstate layout: IOAPIC base address 0xFEC00000 not found".to_string()
+        ));
+    }
+
+    // 4. Parse and validate CPUID entries
+    let cpuid_entries = parse_cpuid(data);
+    if cpuid_entries.is_empty() {
+        return Err(VmstateValidationError::InvalidCpuid(
+            "no valid CPUID entries found in vmstate".to_string()
+        ));
+    }
+
+    // 5. Validate MSR entries exist
+    let msrs = parse_msrs(data);
+    if msrs.is_empty() {
+        return Err(VmstateValidationError::InvalidMsrSet(
+            "no valid MSR entries found in vmstate".to_string()
+        ));
+    }
+
+    // 6. Validate memory state is present (check for non-zero RIP)
+    let shift = detect_offset_shift(data).unwrap();
+    let rip = r64(data, adj(REF_REGS, shift) + 128);
+    if rip == 0 {
+        return Err(VmstateValidationError::CorruptData(
+            "vmstate has zero RIP - invalid CPU state".to_string()
+        ));
+    }
+
+    Ok(())
+}
 
 // Reference offsets for Firecracker v1.12.0, 1 vCPU, x86_64.
 // These are the known offsets for ONE specific vmstate layout.

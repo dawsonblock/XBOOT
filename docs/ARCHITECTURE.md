@@ -53,13 +53,32 @@ Applies:
 
 Acts as a supervisor inside the guest. It starts worker processes before snapshotting, prints `ZEROBOOT_READY ...`, and mediates all execution requests.
 
-### `guest/worker.py`
+### `guest/worker_supervisor.py`
 
-Persistent Python worker. It executes code in-process, captures stdout/stderr, and returns a framed worker response.
+Python worker supervisor. Spawns a fresh child executor for each request, providing strong isolation between requests.
 
-### `guest/worker_node.js`
+### `guest/worker_child.py`
 
-Persistent Node worker using the `vm` module for bounded script execution.
+Python child executor - runs once per request in a fresh process, then exits. Ensures no state bleeds between requests.
+
+### `guest/worker_supervisor.js` / `guest/worker_child.js`
+
+Node.js equivalent of the Python subprocess isolation model.
+
+## Production Security Model
+
+### Trust Chain (Prod Mode)
+- **Startup fail-closed**: Server refuses to start without all required security config
+- **Template verification**: All artifacts must have SHA256 hashes
+- **Signature verification**: Manifest must be signed by a trusted key
+- **Release channel**: Template must be promoted to configured channel (default: "prod")
+- **Schema version**: Only schema v1 supported in prod mode
+
+### Guest Isolation
+- **Subprocess model**: Each request runs in a fresh child process inside the same guest VM
+- **Process exit**: Child exits after each request, minimizing in-memory state reuse
+- **Filesystem behavior**: All requests share the same guest filesystem; any per-request scratch or cleanup is handled in user space
+- **Process isolation**: Isolation between requests is provided by the OS process model within a single guest VM, not by separate VMs or mount/user namespaces
 
 ## Current boundaries
 

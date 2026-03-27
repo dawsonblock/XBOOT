@@ -1,7 +1,10 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::env;
+use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
+
+use crate::template_manifest::VerificationMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthMode {
@@ -44,9 +47,7 @@ pub struct ArtifactConfig {
     pub require_template_hashes: bool,
     pub allowed_firecracker_version: Option<String>,
     pub allowed_firecracker_binary_sha256: Option<String>,
-    #[allow(dead_code)]
     pub release_channel: Option<String>,
-    #[allow(dead_code)]
     pub require_template_signatures: bool,
     pub keyring_path: Option<PathBuf>,
 }
@@ -173,6 +174,78 @@ impl ServerConfig {
     pub fn is_trusted_proxy(&self, addr: IpAddr) -> bool {
         self.trusted_proxies.contains(&addr)
     }
+
+    /// Returns the verification mode based on auth mode
+    pub fn verification_mode(&self) -> VerificationMode {
+        match self.auth_mode {
+            AuthMode::Prod => VerificationMode::Prod,
+            AuthMode::Dev => VerificationMode::Dev,
+        }
+    }
+
+    /// Returns the expected release channel from config
+    pub fn expected_release_channel(&self) -> Option<&str> {
+        self.artifacts.release_channel.as_deref()
+    }
+
+    /// Validate startup configuration for production mode.
+    /// Returns error if prod mode would run with incomplete/missing required config.
+    pub fn validate_startup(&self) -> Result<()> {
+        // Only validate in prod mode
+        if !matches!(self.auth_mode, AuthMode::Prod) {
+            return Ok(());
+        }
+
+        // Validate ZEROBOOT_REQUIRE_TEMPLATE_HASHES is set
+        if !self.artifacts.require_template_hashes {
+            bail!("prod mode requires ZEROBOOT_REQUIRE_TEMPLATE_HASHES=true");
+        }
+
+        // Validate ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES is set
+        if !self.artifacts.require_template_signatures {
+            bail!("prod mode requires ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=true");
+        }
+
+        // Validate keyring path exists
+        let keyring_path = self.artifacts.keyring_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("prod mode requires ZEROBOOT_KEYRING_PATH to be set")
+        })?;
+        if !keyring_path.is_file() {
+            bail!("prod mode requires ZEROBOOT_KEYRING_PATH to be a file: {}", keyring_path.display());
+        }
+
+        // Validate allowed firecracker version is set
+        if self.artifacts.allowed_firecracker_version.is_none() {
+            bail!("prod mode requires ZEROBOOT_ALLOWED_FIRECRACKER_VERSION to be set");
+        }
+
+        // Validate firecracker binary sha256 is set
+        if self.artifacts.allowed_firecracker_binary_sha256.is_none() {
+            bail!("prod mode requires ZEROBOOT_ALLOWED_FC_BINARY_SHA256 to be set");
+        }
+
+        // Validate release channel is set
+        if self.artifacts.release_channel.is_none() {
+            bail!("prod mode requires ZEROBOOT_RELEASE_CHANNEL to be set");
+        }
+
+        // Validate api_keys_file exists
+        if !self.api_keys_file.is_file() {
+            bail!("prod mode requires api_keys_file to be a file: {}", self.api_keys_file.display());
+        }
+
+        // Validate api_key_pepper_file exists
+        if !self.api_key_pepper_file.is_file() {
+            bail!("prod mode requires api_key_pepper_file to be a file: {}", self.api_key_pepper_file.display());
+        }
+
+        // Validate log_code is false in prod
+        if self.logging.log_code {
+            bail!("prod mode requires logging.log_code=false (no code logging in prod)");
+        }
+
+        Ok(())
+    }
 }
 
 fn usize_env(name: &str, default: usize) -> usize {
@@ -245,5 +318,227 @@ mod tests {
         };
         assert!(cfg.is_trusted_proxy("127.0.0.1".parse().unwrap()));
         assert!(!cfg.is_trusted_proxy("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn prod_without_keyring_fails() {
+        let cfg = ServerConfig {
+            auth_mode: AuthMode::Prod,
+            api_keys_file: PathBuf::from("api_keys.json"),
+            api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            trusted_proxies: vec![],
+            limits: Limits::default(),
+            logging: LoggingConfig {
+                path: PathBuf::from("x"),
+                log_code: false,
+            },
+            health: HealthConfig::default(),
+            bind_addr: "127.0.0.1".into(),
+            queue: QueueConfig::default(),
+            artifacts: ArtifactConfig {
+                require_template_hashes: true,
+                allowed_firecracker_version: Some("1.0.0".into()),
+                allowed_firecracker_binary_sha256: Some("abc123".into()),
+                release_channel: Some("prod".into()),
+                require_template_signatures: true,
+                keyring_path: None, // Missing keyring
+            },
+            pool: PoolConfig::default(),
+        };
+        let result = cfg.validate_startup();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("keyring"), "expected keyring error: {}", err);
+    }
+
+    #[test]
+    fn prod_without_release_channel_fails() {
+        let cfg = ServerConfig {
+            auth_mode: AuthMode::Prod,
+            api_keys_file: PathBuf::from("api_keys.json"),
+            api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            trusted_proxies: vec![],
+            limits: Limits::default(),
+            logging: LoggingConfig {
+                path: PathBuf::from("x"),
+                log_code: false,
+            },
+            health: HealthConfig::default(),
+            bind_addr: "127.0.0.1".into(),
+            queue: QueueConfig::default(),
+            artifacts: ArtifactConfig {
+                require_template_hashes: true,
+                allowed_firecracker_version: Some("1.0.0".into()),
+                allowed_firecracker_binary_sha256: Some("abc123".into()),
+                release_channel: None, // Missing release channel
+                require_template_signatures: true,
+                keyring_path: Some(PathBuf::from("/etc/zeroboot/keyring")),
+            },
+            pool: PoolConfig::default(),
+        };
+        let result = cfg.validate_startup();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("channel"), "expected channel error: {}", err);
+    }
+
+    #[test]
+    fn prod_with_log_code_true_fails() {
+        let cfg = ServerConfig {
+            auth_mode: AuthMode::Prod,
+            api_keys_file: PathBuf::from("api_keys.json"),
+            api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            trusted_proxies: vec![],
+            limits: Limits::default(),
+            logging: LoggingConfig {
+                path: PathBuf::from("x"),
+                log_code: true, // Code logging enabled in prod - should fail
+            },
+            health: HealthConfig::default(),
+            bind_addr: "127.0.0.1".into(),
+            queue: QueueConfig::default(),
+            artifacts: ArtifactConfig {
+                require_template_hashes: true,
+                allowed_firecracker_version: Some("1.0.0".into()),
+                allowed_firecracker_binary_sha256: Some("abc123".into()),
+                release_channel: Some("prod".into()),
+                require_template_signatures: true,
+                keyring_path: Some(PathBuf::from("/etc/zeroboot/keyring")),
+            },
+            pool: PoolConfig::default(),
+        };
+        let result = cfg.validate_startup();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("log_code"), "expected log_code error: {}", err);
+    }
+
+    #[test]
+    fn dev_with_missing_keyring_passes() {
+        let cfg = ServerConfig {
+            auth_mode: AuthMode::Dev,
+            api_keys_file: PathBuf::from("api_keys.json"),
+            api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            trusted_proxies: vec![],
+            limits: Limits::default(),
+            logging: LoggingConfig {
+                path: PathBuf::from("x"),
+                log_code: false,
+            },
+            health: HealthConfig::default(),
+            bind_addr: "127.0.0.1".into(),
+            queue: QueueConfig::default(),
+            artifacts: ArtifactConfig {
+                require_template_hashes: false,
+                allowed_firecracker_version: None,
+                allowed_firecracker_binary_sha256: None,
+                release_channel: None,
+                require_template_signatures: false,
+                keyring_path: None, // Missing but dev mode doesn't care
+            },
+            pool: PoolConfig::default(),
+        };
+        let result = cfg.validate_startup();
+        assert!(result.is_ok(), "dev mode should pass without keyring: {:?}", result);
+    }
+
+    #[test]
+    fn verification_mode_dev() {
+        let cfg = ServerConfig {
+            auth_mode: AuthMode::Dev,
+            api_keys_file: PathBuf::from("api_keys.json"),
+            api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            trusted_proxies: vec![],
+            limits: Limits::default(),
+            logging: LoggingConfig::default(),
+            health: HealthConfig::default(),
+            bind_addr: "127.0.0.1".into(),
+            queue: QueueConfig::default(),
+            artifacts: ArtifactConfig::default(),
+            pool: PoolConfig::default(),
+        };
+        assert_eq!(cfg.verification_mode(), VerificationMode::Dev);
+    }
+
+    #[test]
+    fn verification_mode_prod() {
+        let cfg = ServerConfig {
+            auth_mode: AuthMode::Prod,
+            api_keys_file: PathBuf::from("api_keys.json"),
+            api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            trusted_proxies: vec![],
+            limits: Limits::default(),
+            logging: LoggingConfig::default(),
+            health: HealthConfig::default(),
+            bind_addr: "127.0.0.1".into(),
+            queue: QueueConfig::default(),
+            artifacts: ArtifactConfig::default(),
+            pool: PoolConfig::default(),
+        };
+        assert_eq!(cfg.verification_mode(), VerificationMode::Prod);
+    }
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_request_body_bytes: 256 * 1024,
+            max_code_bytes: 128 * 1024,
+            max_stdin_bytes: 64 * 1024,
+            max_batch_size: 16,
+            max_stdout_bytes: 64 * 1024,
+            max_stderr_bytes: 64 * 1024,
+            max_total_output_bytes: 96 * 1024,
+            max_timeout_secs: 30,
+            max_concurrent_requests: 32,
+        }
+    }
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::from("/var/lib/zeroboot/requests.jsonl"),
+            log_code: false,
+        }
+    }
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            probe_timeout_secs: 2,
+            cache_ttl_secs: 10,
+        }
+    }
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self { wait_timeout_ms: 250 }
+    }
+}
+
+impl Default for ArtifactConfig {
+    fn default() -> Self {
+        Self {
+            require_template_hashes: false,
+            allowed_firecracker_version: None,
+            allowed_firecracker_binary_sha256: None,
+            release_channel: None,
+            require_template_signatures: false,
+            keyring_path: None,
+        }
+    }
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            min_idle_per_lang: 0,
+            max_idle_per_lang: 4,
+            borrow_timeout_ms: 5000,
+            health_check_interval_secs: 30,
+        }
     }
 }
