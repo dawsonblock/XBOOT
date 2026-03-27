@@ -1,57 +1,783 @@
-# XBOOT File-by-File Remediation Implementation Plan
+# XBOOT Full Implementation Plan
 
-## 1. OBJECTIVE
+## Executive Summary
 
-Turn the XBOOT repository from a strong prototype into a defensible bounded execution service by implementing a strict trust chain, guest execution isolation, restore safety, and deployment hardening. The goal is to make prod mode fail-closed and ensure only signed, version-pinned, hash-verified templates can run.
+This plan transforms XBOOT from a strong pre-production sandbox into a system ready for internal production use. The approach prioritizes truth and correctness before feature expansion.
 
-## 2. CONTEXT SUMMARY
+**Target State:**
+- Buildable from a clean supported host
+- Reproducible guest artifact generation
+- Measurable under load
+- Safe for internal multi-tenant use with trusted callers
+- Ready for public hardening pass later
 
-The XBOOT codebase is a Rust-based microVM execution service using Firecracker/KVM. Key components:
+**Strategy:** Five phases executed in order:
+1. Make it build and boot
+2. Prove one real exec path  
+3. Make it operationally stable
+4. Make it secure enough for serious use
+5. Make it scalable and consumable
 
-- **Trust chain files:** `src/config.rs`, `src/main.rs`, `src/signing.rs`, `src/template_manifest.rs`
-- **Guest execution:** `guest/worker.py`, `guest/worker_node.js`, `guest/init.c`
-- **Deployment:** `deploy/deploy.sh`, `deploy/zeroboot.service`, `scripts/preflight.sh`
-- **Restore safety:** `src/vmm/vmstate.rs`, `src/vmm/kvm.rs`, `src/vmm/firecracker.rs`
+---
 
-**Key issues identified:**
-- Prod mode has no startup validation (config fields have `#[allow(dead_code)]`)
-- Signature payload is ambiguous (concatenates JSON without field names)
-- Hardcoded "prod" channel instead of using configured release channel
-- Python/Node workers execute user code in long-lived processes (security risk)
-- No path confinement for all artifact paths (only snapshots)
-- Tests use wrong type for schema_version (string "1.0" vs u32)
+## Phase 0 — Establish Baseline (P0)
 
-## 3. APPROACH OVERVIEW
+### P0.1 Truth Reset and Support Matrix
 
-Implement the fix in the order specified in the blueprint:
-
-1. **Trust chain first:** Add startup fail-closed validation, centralize verification policy, fix canonical signing payload, enforce strict manifest policy
-2. **Guest isolation second:** Split Python/Node workers into supervisor + per-request child executor
-3. **Restore safety third:** Split vmstate.rs, add pre-restore validation
-4. **Deploy hardening last:** Tighten preflight, deploy script, systemd unit
-5. **CI and docs:** Add workflow, fix documentation claims
-
-This order matters - don't polish metrics while prod mode can still drift into unsafe configuration.
-
-## 4. IMPLEMENTATION STEPS
-
-### 4.1 Commit 1 — Add Startup Fail-Closed Policy
-
-**Goal:** Make prod startup reject incomplete trust config before the server binds a port.
+**Goal:** Remove false claims, define exact supported environment.
 
 **Files:**
+- `README.md`
+- `docs/DEPLOYMENT.md`
+- `docs/ARCHITECTURE.md`
+- `PATCHES_APPLIED.md`
+- `UPGRADE_NOTES.md`
+
+**Actions:**
+- Remove/soften any "production-ready" claims
+- State exact support matrix:
+  - Linux distro/version (e.g., Ubuntu 22.04)
+  - Kernel minimum version
+  - KVM required
+  - Rust toolchain version
+  - Firecracker version
+  - Python version
+  - Node version
+  - cgroup/systemd expectations
+- Document the real runtime spine:
+  ```
+  API → admission → VM allocate/restore → serial protocol → 
+  guest supervisor → child exec → validated response → metrics/logs
+  ```
+
+**Done when:** Docs no longer overclaim; supported environment is concrete.
+
+---
+
+### P0.2 Canonical Artifact Layout
+
+**Goal:** Define single artifact directory structure all code agrees on.
+
+**Files:**
+- `docs/DEPLOYMENT.md`
 - `src/config.rs`
+- `src/template_manifest.rs`
+- `scripts/validate_template_manifest.py`
+- `manifests/*.manifest`
+- `manifests/*.lock.json`
+
+**Actions:**
+Define canonical layout:
+```
+artifacts/
+  firecracker/
+  kernel/
+  rootfs/
+  templates/
+    python/
+    node/
+```
+Ensure config resolves paths from this layout consistently.
+
+**Done when:** One documented layout; config and validation agree.
+
+---
+
+### P0.3 Strict Preflight
+
+**Goal:** Fail before boot if host or artifacts are wrong.
+
+**Files:**
+- `scripts/preflight.sh`
+- `docs/DEPLOYMENT.md`
+
+**Actions:** Preflight must hard-fail on:
+- Missing /dev/kvm
+- Missing Firecracker binary
+- Missing kernel/rootfs/template artifacts
+- Wrong permissions/ownership
+- Unsupported host kernel/systemd
+- Manifest mismatch
+- Missing signing policy files in production mode
+
+**Done when:** Preflight returns nonzero for any missing hard dependency.
+
+---
+
+### P0.4 Host Build and Test Proof
+
+**Goal:** Prove Rust host builds and tests work.
+
+**Files:**
+- `Cargo.toml`
+- `Cargo.lock`
+- `src/**/*.rs`
+
+**Actions:**
+- Ensure `cargo build --release` succeeds
+- Ensure `cargo test` passes
+- Fix any dependency drift or module issues
+
+**Done when:** Release build and tests pass on clean supported host.
+
+---
+
+### P0.5 Deterministic Guest Artifact Build
+
+**Goal:** Make guest image/template generation reproducible.
+
+**Files:**
+- `scripts/build_guest_rootfs.sh`
+- `scripts/build_rootfs_image.sh`
+- `scripts/build_reproducible_image.py`
+- `manifests/*.manifest`
+- `manifests/*.lock.json`
+
+**Actions:**
+- Pin tool versions where possible
+- Normalize output paths
+- Ensure output hashes match manifest expectations
+- Document one canonical artifact build sequence
+
+**Done when:** Clean host can rebuild rootfs/template set; hashes match.
+
+---
+
+### P0.6 Python-Only Golden Path
+
+**Goal:** Get one language path fully real before expanding.
+
+**Files:**
+- `guest/worker_supervisor.py`
+- `guest/worker_child.py`
+- `manifests/python-guest.manifest`
+- `manifests/python-build.lock.json`
+
+**Actions:**
+- Treat Python as only supported path for milestone 1
+- Ensure guest supervisor and child model are clean
+- Defer Node until later
+
+**Done when:** Python template builds; golden smoke path defined.
+
+---
+
+### P0.7 Protocol Handshake Validation
+
+**Goal:** Prove host↔guest protocol is strict and fail-closed.
+
+**Files:**
+- `src/protocol.rs`
+- `src/vmm/serial.rs`
+- `guest/worker_supervisor.py`
+
+**Actions:** Verify:
+- Ready handshake
+- Request ID round-trip
+- Protocol version check
+- Checksum validation
+- Malformed frame rejection
+- Response/request size bounds
+
+**Done when:** Host rejects malformed/mismatched frames; VM marked bad on protocol mismatch.
+
+---
+
+### P0.8 One Real KVM-Backed Smoke Flow
+
+**Goal:** Prove end-to-end execution with real VM.
+
+**Files:**
 - `src/main.rs`
+- `src/api/handlers.rs`
+- `src/vmm/firecracker.rs`
+- `src/vmm/kvm.rs`
+- `src/vmm/vmstate.rs`
+- `guest/*.py`
+- Smoke script
 
-**Method:**
+**Actions:** Build canonical smoke test:
+1. Run preflight
+2. Start API
+3. POST one Python request
+4. Receive valid JSON result
+5. Verify metrics changed
+6. Clean shutdown
 
-1. In `src/config.rs`, add:
-   - `ServerConfig::validate_startup(&self) -> Result<()>` - validates all required prod fields exist
-   - `ServerConfig::expected_release_channel(&self) -> Option<&str>` - returns configured channel
-   - `ServerConfig::verification_mode(&self) -> VerificationMode` - returns current mode
+**Done when:** One KVM-backed end-to-end smoke works; documented and scriptable.
 
-2. In prod mode, require:
-   - `ZEROBOOT_REQUIRE_TEMPLATE_HASHES=true`
+---
+
+## Phase 1 — Make Runtime Trustworthy Under Failure (P1)
+
+### P1.1 Explicit VM State Machine
+
+**Goal:** Replace implicit state with hard state model.
+
+**Files:**
+- `src/vmm/vmstate.rs`
+- `src/vmm/firecracker.rs`
+- `src/vmm/kvm.rs`
+
+**Actions:** Define states:
+- Cold, Restoring, Ready, Busy, Draining, Corrupt, Dead
+
+Make transitions explicit.
+
+**Done when:** VM lifecycle uses explicit states, not loose booleans.
+
+---
+
+### P1.2 Quarantine and Teardown Rules
+
+**Goal:** Never reuse suspect VM.
+
+**Files:**
+- `src/vmm/vmstate.rs`
+- `src/vmm/firecracker.rs`
+- `src/vmm/kvm.rs`
+
+**Actions:** Quarantine on:
+- Checksum mismatch
+- Protocol mismatch
+- Malformed ready handshake
+- Repeated timeout
+- Unexpected EOF mid-request
+- Corrupt response decode
+
+Make teardown idempotent.
+
+**Done when:** Corrupt VMs marked unusable; teardown safe to call twice.
+
+---
+
+### P1.3 Guest Subprocess Hardening
+
+**Goal:** Make per-request guest execution bounded and clean.
+
+**Files:**
+- `guest/worker_supervisor.py`
+- `guest/worker_child.py`
+- `guest/worker_supervisor.js`
+- `guest/worker_child.js`
+
+**Actions:** Enforce:
+- Timeout kill
+- Zombie cleanup
+- Bounded stdout/stderr
+- Bounded total response size
+- Sanitized env
+- Fresh per-request workdir
+- Temp cleanup
+- Structured child invocation (no shell)
+
+**Done when:** One request cannot pollute next; output/runtime bounded.
+
+---
+
+### P1.4 Host Timeout and Abort Discipline
+
+**Goal:** Hung guests don't wedge the API.
+
+**Files:**
+- `src/api/handlers.rs`
+- `src/vmm/firecracker.rs`
+- `src/vmm/kvm.rs`
+- `src/vmm/serial.rs`
+
+**Actions:**
+- Host timeout cancels request cleanly
+- Bad guest response doesn't produce partial success
+- Slow/stalled serial path fails and quarantines appropriately
+
+**Done when:** API returns proper timeout/error; bad guest can't hang request threads.
+
+---
+
+### P1.5 Critical Panic Removal
+
+**Goal:** Remove unwrap()/expect() from hot paths.
+
+**Files:** All `src/**/*.rs`
+
+**Actions:** Search and replace panic-prone calls in:
+- Config load, auth load, manifest load
+- VM create/restore, serial I/O
+- API handling, metrics init
+
+**Done when:** No panic-based failure in core request path.
+
+---
+
+### P1.6 Canonical Error Taxonomy
+
+**Goal:** Make failures understandable, map to HTTP results.
+
+**Files:**
+- `src/api/handlers.rs`
+- `src/api/errors.rs` (create)
+- `src/config.rs`
+- `src/template_manifest.rs`
+- `src/vmm/*.rs`
+- `src/auth.rs`
+
+**Actions:** Define error families:
+- Config, Auth, Admission, Artifact validation
+- VM allocation, Protocol, Guest execution
+- Timeout, Capacity, Invariant violation
+
+Map each to stable HTTP status and response body.
+
+**Done when:** API errors stable and typed; logs include machine-readable error codes.
+
+---
+
+### P1.7 API Admission Control Before Expensive Work
+
+**Goal:** Reject bad requests before touching VMs.
+
+**Files:**
+- `src/api/handlers.rs`
+- `src/auth.rs`
+- `src/config.rs`
+
+**Actions:** Before VM allocation, reject:
+- Invalid auth, unsupported language
+- Bad template/channel, oversized payload
+- Batch too large, impossible timeout
+- Queue full
+
+**Done when:** Bad caller input never reaches expensive restore/exec path.
+
+---
+
+### P1.8 Metrics and Structured Logs
+
+**Goal:** Give operators visibility to debug and measure.
+
+**Files:**
+- `src/main.rs`
+- `src/api/handlers.rs`
+- `deploy/grafana-dashboard.json`
+
+**Actions:** Emit:
+- Request count by outcome/language/template
+- Request latency histogram, queue wait histogram
+- VM restore latency, guest exec latency
+- Timeout count, protocol error count
+- Auth rejection count, VM counts by state
+
+Use structured logs with: request_id, vm_id, template_id, client_id, language, duration_ms, outcome, error_code
+
+**Done when:** Dashboard reflects real metrics; logs are parseable.
+
+---
+
+## Phase 2 — Make Maintainable and Performant (P2)
+
+### P2.1 Split Oversized Host Files
+
+**Goal:** Break large modules into coherent pieces.
+
+**Files:**
+- `src/main.rs` → `src/bootstrap.rs`, `src/server.rs`, `src/runtime.rs`
+- `src/api/handlers.rs` → `src/api/exec.rs`, `src/api/batch.rs`, `src/api/health.rs`, `src/api/metrics.rs`, `src/api/errors.rs`
+- `src/template_manifest.rs` → `src/template_manifest/schema.rs`, `src/template_manifest/verify.rs`, `src/template_manifest/policy.rs`
+
+**Done when:** Each file has one dominant responsibility; build/tests pass.
+
+---
+
+### P2.2 Auth/Docs Alignment
+
+**Goal:** Documented auth matches implemented auth.
+
+**Files:**
+- `src/auth.rs`
+- `docs/API.md`
+- `scripts/make_api_keys.py`
+
+**Actions:**
+- If using HMAC-hashed keys with peppering, document it
+- Remove stale "plain key JSON" narrative
+- Define trusted proxy rules, identity derivation, rate-limit subject rules
+
+**Done when:** API docs accurately describe auth; key generation matches runtime.
+
+---
+
+### P2.3 Warm Pool as First-Class Runtime
+
+**Goal:** Turn low-latency architecture into measurable capacity system.
+
+**Files:**
+- `scripts/warm_pool_scaler.py`
+- `src/vmm/*.rs`
+- `src/config.rs`
+
+**Actions:** Define:
+- Minimum idle pool per template, max pool size
+- Refill threshold, max requests per VM, max age
+- Drain/retire policy, corruption handling
+- Separate warm-hit from cold-start path
+
+**Done when:** Runtime maintains idle VMs; warm vs cold metrics explicit.
+
+---
+
+### P2.4 Load and Chaos Validation
+
+**Goal:** Measure actual behavior under stress.
+
+**Files:** Test harness scripts, CI workflows
+
+**Actions:** Add scenarios:
+- Concurrent request load, repeated timeouts
+- Malformed protocol frames, VM death mid-request
+- Queue overload, warm-pool depletion
+
+**Done when:** Reproducible latency/failure data; p50/p95/p99 warm/cold separated.
+
+---
+
+### P2.5 SDK Stabilization
+
+**Goal:** Make Python/Node SDKs usable against stable v1.
+
+**Files:**
+- `sdk/python/**`
+- `sdk/node/**`
+- `docs/API.md`
+
+**Actions:** Support only:
+- Execute, batch execute, health/ready
+- Auth config, typed errors, timeout handling
+
+**Done when:** Each SDK runs golden smoke flow; error handling matches API v1.
+
+---
+
+### P2.6 Operator Runbook
+
+**Goal:** Give operator enough to run, debug, rotate, recover.
+
+**Files:**
+- `docs/RUNBOOK.md` (create)
+- `docs/DEPLOYMENT.md`
+
+**Actions:** Document:
+- Preflight, artifact install, first boot, health validation
+- Key rotation, artifact rotation, draining/restarting
+- Quarantining bad templates/VMs, reading dashboard/logs
+- Rollback process
+
+**Done when:** Operator who didn't write system can run it; recovery steps explicit.
+
+---
+
+## Phase 3 — Finish Supply Chain and Release (P3)
+
+### P3.1 Signed Artifact Enforcement
+
+**Goal:** Turn signing from hook into actual policy.
+
+**Files:**
+- `src/signing.rs`
+- `src/template_manifest.rs`
+- Manifest files, deployment docs
+
+**Actions:** Decide and enforce:
+- Signature required/optional by environment
+- Accepted key formats, rejection behavior
+- Revocation/rotation workflow
+
+**Done when:** Production refuses unsigned/invalid artifacts; docs explain signing.
+
+---
+
+### P3.2 Promotion Pipeline
+
+**Goal:** Artifacts move through environments with provenance.
+
+**Files:** CI workflows, deployment scripts, docs
+
+**Actions:** Define:
+- dev → staging → production promotion
+- Hash pinning, signature verification at each stage
+- Provenance: source commit, build timestamp, tool versions, artifact hashes
+
+**Done when:** Operator can answer where production template came from.
+
+---
+
+### P3.3 Self-Hosted KVM CI as Release Gate
+
+**Goal:** Live validation is mandatory, not optional.
+
+**Files:** `.github/workflows/*`
+
+**Actions:** Make release-blocking KVM CI:
+1. Build host binary
+2. Build guest artifacts
+3. Validate manifests
+4. Create template, boot/restore VM
+5. Run smoke exec, timeout exec, malformed frame rejection
+6. Export metrics/log artifacts
+
+**Done when:** No release without live KVM validation.
+
+---
+
+### P3.4 Security Review Pass
+
+**Goal:** Close obvious gaps before public exposure.
+
+**Files:** All source, guest, deployment, docs
+
+**Actions:** Review:
+- Guest env leakage, network exposure
+- Path traversal, queue abuse, batch amplification
+- Logging of user code/secrets
+- Firecracker/jailer confinement, systemd hardening
+- Rootfs immutability expectations
+
+**Done when:** High-severity findings fixed or documented as blockers.
+
+---
+
+## Detailed Patch Map
+
+### Patch Set 1 — Truth, Docs, Build Contract
+
+#### README.md
+- Remove "production-ready" claims
+- Add hard support matrix
+- Add "What this repo does not include" section
+- Add canonical runtime path diagram
+
+#### docs/API.md
+- Fix auth section to match src/auth.rs (hashed records, not raw keys)
+- Add stable error envelope examples
+- Add truncation semantics for stdout/stderr
+
+#### docs/DEPLOYMENT.md
+- Replace vague deployment language with strict sequence
+- Add canonical artifact layout
+- Add prod-mode checklist
+
+#### docs/ARCHITECTURE.md
+- Add trust boundary section
+- Add "Known current limits" section
+
+---
+
+### Patch Set 2 — Auth and Startup Integrity
+
+#### src/auth.rs → Split into:
+- `src/auth/mod.rs`
+- `src/auth/records.rs` - ApiKeyRecord
+- `src/auth/verifier.rs` - verification logic
+- `src/auth/context.rs` - header extraction
+
+Use constant-time compare; return typed auth errors.
+
+#### scripts/make_api_keys.py
+- Replace raw token arrays with hashed records + secrets file
+- Add --label, --pepper-file, --records-output, --tokens-output flags
+
+#### src/config.rs → Split into:
+- `src/config/mod.rs`
+- `src/config/auth.rs`
+- `src/config/limits.rs`
+- `src/config/logging.rs`
+- `src/config/artifacts.rs`
+- `src/config/pool.rs`
+- `src/config/validation.rs`
+
+Strengthen validate_startup() for prod mode.
+
+---
+
+### Patch Set 3 — API Surface and Admission
+
+#### src/api/handlers.rs → Split into:
+- `src/api/mod.rs`
+- `src/api/types.rs`
+- `src/api/errors.rs`
+- `src/api/auth.rs`
+- `src/api/admission.rs`
+- `src/api/exec.rs`
+- `src/api/batch.rs`
+- `src/api/health.rs`
+- `src/api/metrics.rs`
+- `src/api/logging.rs`
+
+Add typed ApiError enum; separate timing metrics; move request rejection before VM acquisition.
+
+---
+
+### Patch Set 4 — Runtime Bootstrap and CLI
+
+#### src/main.rs → Split into:
+- `src/main.rs` (thin - parse/dispatch only)
+- `src/cli.rs`
+- `src/bootstrap.rs`
+- `src/server.rs`
+- `src/template_cmd.rs`
+- `src/test_exec_cmd.rs`
+- `src/fork_bench_cmd.rs`
+- `src/keygen_cmd.rs`
+- `src/sign_cmd.rs`
+
+Create single build_app_state() function.
+
+---
+
+### Patch Set 5 — Template Trust and Supply Chain
+
+#### src/template_manifest.rs → Split into:
+- `src/template_manifest/mod.rs`
+- `src/template_manifest/schema.rs`
+- `src/template_manifest/verify.rs`
+- `src/template_manifest/policy.rs`
+- `src/template_manifest/errors.rs`
+
+Define one canonical JSON manifest schema; make path confinement explicit.
+
+#### scripts/validate_template_manifest.py
+- Update to validate same canonical schema
+- Add --mode dev|staging|prod flag
+
+#### src/signing.rs → Split into:
+- `src/signing/mod.rs`
+- `src/signing/keys.rs`
+- `src/signing/verify.rs`
+- `src/signing/sign.rs`
+
+Define environment behavior; support key rotation.
+
+---
+
+### Patch Set 6 — VM Lifecycle
+
+#### src/vmm/vmstate.rs
+- Add explicit VmLifecycleState enum
+- Add VmCorruptionReason enum
+
+#### src/vmm/firecracker.rs → Split into:
+- `src/vmm/firecracker.rs`
+- `src/vmm/process.rs`
+- `src/vmm/restore.rs`
+- `src/vmm/guest_ready.rs`
+
+Make teardown idempotent; emit lifecycle events.
+
+#### src/vmm/kvm.rs → Split into:
+- `src/vmm/kvm.rs`
+- `src/vmm/allocator.rs`
+- `src/vmm/fork.rs`
+- `src/vmm/executor.rs`
+
+Return structured ExecutionTrace.
+
+#### src/vmm/serial.rs
+- Harden framed I/O; add max frame size, request ID correlation
+- Move protocol parsing to src/protocol.rs
+
+---
+
+### Patch Set 7 — Guest Execution
+
+#### guest/worker_supervisor.py
+- Minimal allowlisted environment
+- Unique per-request scratch dir
+- Hard timeout/output enforcement
+- Structured child invocation (no shell)
+
+#### guest/worker_child.py
+- Keep tiny - receive, execute, emit, exit
+- Explicit truncation markers
+
+#### guest/init.c
+- Audit boot-time responsibilities
+- Split if doing too much
+
+---
+
+### Patch Set 8 — Preflight, Build, CI
+
+#### scripts/preflight.sh
+- Add --template <dir> mode
+- Check prod-mode required files
+
+#### scripts/build_guest_rootfs.sh
+- Emit metadata JSON with build timestamp, source commit, versions
+
+#### .github/workflows/ci.yml
+- Fix manifest validation job
+- Make KVM smoke include malformed frame test, timeout test
+- Archive logs and metrics
+
+---
+
+### Patch Set 9 — Service Hardening
+
+#### deploy/zeroboot.service
+- Add prod env example
+- Consider hardening additions that don't break KVM
+
+#### deploy/deploy.sh
+- Make deployment atomic with release layout
+- Add preflight, smoke test, rollback
+
+#### deploy/grafana-dashboard.json
+- Align panels to emitted metrics only
+
+---
+
+## Testing Plan
+
+### New Test Files to Create:
+- `tests/test_auth_records.py` - key generation and verification
+- `tests/test_api_error_mapping.py` - error status codes
+- `tests/test_preflight_modes.py` - preflight strictness
+- `tests/test_rate_limit_identity.py` - proxy and identity derivation
+- `tests/test_manifest_policy_modes.py` - dev/staging/prod enforcement
+
+### Extend Existing Tests:
+- `tests/test_template_manifest_validator.py` - missing fields, path escape, invalid channel
+- `tests/test_worker_protocol.py` - mismatched ID, oversized stdout, malformed flags
+- `tests/test_guest_worker_subprocess.py` - scratch cleanup, env scrub, no state bleed
+
+---
+
+## Milestone Sequence
+
+| Milestone | Includes | Result |
+|-----------|----------|--------|
+| A - Honest and Buildable | P0.1-P0.4 | Docs honest; host builds; artifact layout coherent; preflight catches issues |
+| B - One Real Execution | P0.5-P0.8 | Python path works through real KVM |
+| C - Failure-Safe Runtime | P1.1-P1.8 | Runtime survives corruption, timeout, bad callers |
+| D - Operable Service | P2.1-P2.6 | Maintainable code; docs match auth; SDKs usable; runbook exists |
+| E - Fast and Measured | P2.3-P2.4 | Warm pool exists; latency/capacity measured |
+| F - Controlled Release | P3.1-P3.4 | Artifact trust, promotion, live validation, security posture real |
+
+---
+
+## Execution Priority (First 10 Patches)
+
+1. **README.md** - Remove false production claims
+2. **docs/API.md** - Fix auth docs to match src/auth.rs
+3. **scripts/make_api_keys.py** - Generate hashed records, not raw-key arrays
+4. **src/config.rs** - Strengthen startup validation and proxy parsing
+5. **scripts/preflight.sh** - Make checks real
+6. **src/api/handlers.rs** - Extract errors.rs, types.rs, admission.rs
+7. **src/template_manifest.rs** - Define one canonical manifest schema
+8. **scripts/validate_template_manifest.py** - Validate same schema as runtime
+9. **src/vmm/firecracker.rs + kvm.rs** - Add explicit quarantine and idempotent teardown
+10. **guest/worker_supervisor.py + worker_child.py** - Enforce scratch dir, env scrub, output caps
+
+That sequence gives truth, then startup integrity, then request-path safety.
    - `ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=true`
    - non-empty `ZEROBOOT_KEYRING_PATH` with file existing
    - non-empty `ZEROBOOT_ALLOWED_FIRECRACKER_VERSION`

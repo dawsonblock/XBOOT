@@ -103,6 +103,23 @@ fn load_snapshot(
     drop(mem_data);
 
     let state_data = std::fs::read(&state_path)?;
+
+    // Pre-restore validation: verify vmstate before any KVM mutation
+    // This is the first line of defense against corrupt/mismatched snapshots
+    let firecracker_version = config
+        .and_then(|c| c.artifacts.allowed_firecracker_version.as_deref());
+    if let Some(cfg) = config {
+        if let Some(firecracker_version) = cfg.artifacts.allowed_firecracker_version.as_deref() {
+            if let Err(e) = vmstate::pre_restore_validate(
+                &state_data,
+                Some(firecracker_version),
+                manifest.vcpu_count,
+            ) {
+                anyhow::bail!("vmstate pre-restore validation failed: {:?}", e);
+            }
+        }
+    }
+
     let parsed = vmstate::parse_vmstate(&state_data)?;
     eprintln!(
         "  CPU state loaded: RIP={:#x}, RSP={:#x}, CR3={:#x}",
