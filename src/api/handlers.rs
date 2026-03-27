@@ -258,6 +258,14 @@ pub struct Metrics {
     pub queue_rejections: AtomicU64,
     pub health_failures: AtomicU64,
     pub template_quarantines: AtomicU64,
+    // Additional trust chain and restore metrics (Commit 14)
+    pub manifest_verification_failures: AtomicU64,
+    pub signature_verification_failures: AtomicU64,
+    pub template_version_mismatches: AtomicU64,
+    pub restore_failures: AtomicU64,
+    pub worker_boot_failures: AtomicU64,
+    pub worker_protocol_failures: AtomicU64,
+    pub guest_unhealthy_templates: AtomicU64,
     pub language_counters: Mutex<HashMap<String, LanguageMetrics>>,
 }
 
@@ -280,6 +288,14 @@ impl Metrics {
             queue_rejections: AtomicU64::new(0),
             health_failures: AtomicU64::new(0),
             template_quarantines: AtomicU64::new(0),
+            // Additional trust chain and restore metrics (Commit 14)
+            manifest_verification_failures: AtomicU64::new(0),
+            signature_verification_failures: AtomicU64::new(0),
+            template_version_mismatches: AtomicU64::new(0),
+            restore_failures: AtomicU64::new(0),
+            worker_boot_failures: AtomicU64::new(0),
+            worker_protocol_failures: AtomicU64::new(0),
+            guest_unhealthy_templates: AtomicU64::new(0),
             language_counters: Mutex::new(HashMap::new()),
         }
     }
@@ -1184,6 +1200,14 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
         m.queue_rejections.load(Ordering::Relaxed),
         m.health_failures.load(Ordering::Relaxed),
         m.template_quarantines.load(Ordering::Relaxed),
+        // Additional trust chain and restore metrics (Commit 14)
+        m.manifest_verification_failures.load(Ordering::Relaxed),
+        m.signature_verification_failures.load(Ordering::Relaxed),
+        m.template_version_mismatches.load(Ordering::Relaxed),
+        m.restore_failures.load(Ordering::Relaxed),
+        m.worker_boot_failures.load(Ordering::Relaxed),
+        m.worker_protocol_failures.load(Ordering::Relaxed),
+        m.guest_unhealthy_templates.load(Ordering::Relaxed),
         concurrent,
         available_slots,
         used_slots,
