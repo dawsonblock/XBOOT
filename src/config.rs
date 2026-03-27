@@ -235,8 +235,8 @@ impl ServerConfig {
         }
 
         // Validate api_key_pepper_file exists
-        if !self.api_key_pepper_file.exists() {
-            bail!("prod mode requires api_key_pepper_file to exist: {}", self.api_key_pepper_file.display());
+        if !self.api_key_pepper_file.is_file() {
+            bail!("prod mode requires api_key_pepper_file to be a file: {}", self.api_key_pepper_file.display());
         }
 
         // Validate log_code is false in prod
