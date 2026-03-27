@@ -230,8 +230,8 @@ impl ServerConfig {
         }
 
         // Validate api_keys_file exists
-        if !self.api_keys_file.exists() {
-            bail!("prod mode requires api_keys_file to exist: {}", self.api_keys_file.display());
+        if !self.api_keys_file.is_file() {
+            bail!("prod mode requires api_keys_file to be a file: {}", self.api_keys_file.display());
         }
 
         // Validate api_key_pepper_file exists
