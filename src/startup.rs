@@ -217,9 +217,21 @@ fn verify_firecracker_binary(config: &ServerConfig) -> Result<()> {
             resolved_binary.display()
         );
     }
-    let version = String::from_utf8_lossy(&version_output.stdout)
-        .trim()
-        .to_string();
+    let version = if version_output.stdout.is_empty() {
+        String::from_utf8_lossy(&version_output.stderr)
+            .trim()
+            .to_string()
+    } else {
+        String::from_utf8_lossy(&version_output.stdout)
+            .trim()
+            .to_string()
+    };
+    if version.is_empty() {
+        bail!(
+            "Firecracker version probe returned no output from {}",
+            resolved_binary.display()
+        );
+    }
     if let Some(expected) = config.artifacts.allowed_firecracker_version.as_deref() {
         if version != expected {
             bail!(
