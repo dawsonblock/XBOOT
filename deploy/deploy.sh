@@ -238,7 +238,7 @@ for server in $SERVERS; do
     scp "$KEYRING_FILE" "$server:/tmp/keyring.json"
   fi
 
-  ssh "$server" "sudo tar -xzf '$REMOTE_ARCHIVE' -C '$REMOTE_RELEASE_ROOT' && sudo rm -f '$REMOTE_ARCHIVE'"
+  ssh "$server" "sudo tar --no-same-owner -xzf '$REMOTE_ARCHIVE' -C '$REMOTE_RELEASE_ROOT' && sudo rm -f '$REMOTE_ARCHIVE' && sudo chown -R zeroboot:kvm '$REMOTE_RELEASE_ROOT' && sudo find '$REMOTE_RELEASE_ROOT' -type d -exec chmod 0755 {} + && sudo find '$REMOTE_RELEASE_ROOT' -type f -exec chmod 0644 {} + && sudo find '$REMOTE_RELEASE_ROOT/bin' -maxdepth 1 -type f -exec chmod 0755 {} +"
   ssh "$server" "sudo install -m 0600 /tmp/api_keys.json /etc/zeroboot/api_keys.json && sudo rm -f /tmp/api_keys.json"
   ssh "$server" "sudo install -m 0600 /tmp/pepper /etc/zeroboot/pepper && sudo rm -f /tmp/pepper"
   ssh "$server" "sudo install -m 0600 '$REMOTE_ENV_TMP' /etc/zeroboot/env && sudo rm -f '$REMOTE_ENV_TMP'"
