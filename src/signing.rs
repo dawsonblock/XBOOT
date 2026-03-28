@@ -9,6 +9,31 @@ use std::sync::Arc;
 
 /// Signature algorithm identifier
 pub const SIG_ALGORITHM_ED25519: &str = "ed25519";
+pub const REQUIRED_MANIFEST_SIGNED_FIELDS: &[&str] = &[
+    "artifact_set_id",
+    "build_id",
+    "created_at_unix_ms",
+    "firecracker_binary_sha256",
+    "firecracker_version",
+    "init_path",
+    "kernel_path",
+    "kernel_sha256",
+    "language",
+    "mem_size_mib",
+    "promotion_channel",
+    "protocol_version",
+    "rootfs_path",
+    "rootfs_sha256",
+    "schema_version",
+    "snapshot_mem_bytes",
+    "snapshot_mem_path",
+    "snapshot_mem_sha256",
+    "snapshot_state_bytes",
+    "snapshot_state_path",
+    "snapshot_state_sha256",
+    "template_id",
+    "vcpu_count",
+];
 
 /// Trusted signing key
 #[derive(Debug, Clone)]
@@ -178,6 +203,8 @@ pub fn verify_manifest_signature(
         bail!("manifest_signed_fields is empty - nothing to verify");
     }
 
+    validate_manifest_signed_fields(&signed_fields)?;
+
     // Use canonical payload for verification
     let payload = canonical_manifest_payload(&manifest, &signed_fields)?;
 
@@ -297,6 +324,13 @@ pub fn sign_manifest(
     Ok((signature_b64, String::from_utf8_lossy(&payload).to_string()))
 }
 
+pub fn sign_manifest_with_required_fields(
+    key_pair_bytes: &[u8],
+    manifest_json: &str,
+) -> Result<(String, String)> {
+    sign_manifest(key_pair_bytes, manifest_json, REQUIRED_MANIFEST_SIGNED_FIELDS)
+}
+
 /// Get the public key ID from a key pair (SHA256 hash of public key)
 pub fn get_key_id(public_key: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -361,6 +395,48 @@ pub fn canonical_manifest_payload(
     }
 
     Ok(payload.into_bytes())
+}
+
+pub fn required_manifest_signed_fields_vec() -> Vec<String> {
+    REQUIRED_MANIFEST_SIGNED_FIELDS
+        .iter()
+        .map(|field| (*field).to_string())
+        .collect()
+}
+
+pub fn validate_manifest_signed_fields<S>(signed_fields: &[S]) -> Result<()>
+where
+    S: AsRef<str>,
+{
+    if signed_fields.is_empty() {
+        bail!("manifest_signed_fields is empty");
+    }
+
+    let mut actual = signed_fields
+        .iter()
+        .map(|field| field.as_ref().to_string())
+        .collect::<Vec<_>>();
+    let actual_len = actual.len();
+    actual.sort();
+    actual.dedup();
+    if actual.len() != actual_len {
+        bail!("manifest_signed_fields contains duplicates");
+    }
+
+    let mut expected = REQUIRED_MANIFEST_SIGNED_FIELDS
+        .iter()
+        .map(|field| (*field).to_string())
+        .collect::<Vec<_>>();
+    expected.sort();
+
+    if actual != expected {
+        bail!(
+            "manifest_signed_fields must exactly match the required signing set: {:?}",
+            REQUIRED_MANIFEST_SIGNED_FIELDS
+        );
+    }
+
+    Ok(())
 }
 
 /// Format public key for keyring (base64)

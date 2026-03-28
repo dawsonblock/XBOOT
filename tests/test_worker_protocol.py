@@ -1,15 +1,17 @@
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / 'guest' / 'worker_supervisor.py'
 CHILD = ROOT / 'guest' / 'worker_child.py'
 
 class WorkerProtocolTests(unittest.TestCase):
-    def run_worker(self, code: str, timeout_ms: int = 2000):
+    def run_worker(self, code: str, timeout_ms: int = 2000, *, child_script: Optional[Path] = None):
         proc = subprocess.Popen(
             [sys.executable, str(WORKER)],
             stdin=subprocess.PIPE,
@@ -18,8 +20,9 @@ class WorkerProtocolTests(unittest.TestCase):
             env={
                 **os.environ,
                 'ZEROBOOT_WORKER_MAX_REQUESTS': '32',
-                'ZEROBOOT_CHILD_SCRIPT': str(CHILD),
+                'ZEROBOOT_CHILD_SCRIPT': str(child_script or CHILD),
                 'ZEROBOOT_PYTHON_BIN': sys.executable,
+                'ZEROBOOT_CHILD_LIMIT_PROFILE': 'compat',
             },
         )
         ready = proc.stdout.readline().decode().strip()
@@ -64,6 +67,37 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(error_type, 'timeout')
         self.assertIn('timed out', stderr)
         self.assertEqual(flags & 4, 0)
+
+    def test_malformed_child_frame_is_protocol_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child = Path(tmp) / 'bad_child.py'
+            child.write_text("import sys\nsys.stdout.write('WRK1R bad frame\\n')\n", encoding='utf-8')
+            rid, exit_code, error_type, _stdout, stderr, _flags = self.run_worker('print(1)', child_script=child)
+        self.assertEqual(rid, b't1')
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(error_type, 'protocol')
+        self.assertIn('malformed child response', stderr)
+
+    def test_raw_child_signal_is_internal_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child = Path(tmp) / 'sigkill_child.py'
+            child.write_text(
+                'import os\nimport signal\nos.kill(os.getpid(), signal.SIGKILL)\n',
+                encoding='utf-8',
+            )
+            rid, exit_code, error_type, _stdout, stderr, _flags = self.run_worker('print(1)', child_script=child)
+        self.assertEqual(rid, b't1')
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(error_type, 'internal')
+        self.assertIn('child exited by signal', stderr)
+
+    def test_stdout_truncation_sets_flag(self):
+        rid, exit_code, error_type, stdout, _stderr, flags = self.run_worker("print('x' * 131072)")
+        self.assertEqual(rid, b't1')
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(error_type, 'ok')
+        self.assertTrue(flags & 1)
+        self.assertIn('[truncated]', stdout)
 
 if __name__ == '__main__':
     unittest.main()

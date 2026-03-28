@@ -13,6 +13,7 @@ CHILD_MEMORY_BYTES = 512 * 1024 * 1024
 CHILD_NOFILE = 64
 CHILD_NPROC = 16
 CHILD_FSIZE_BYTES = 2 * 1024 * 1024
+TRUNCATION_MARKER = b"\n[truncated]\n"
 
 
 def read_exact(n: int) -> bytes:
@@ -51,13 +52,24 @@ def write_response(request_id: bytes, exit_code: int, error_type: str, stdout: b
 
 def minimal_child_env() -> dict:
     path = os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
-    return {
+    env = {
         "PATH": path,
         "HOME": "/tmp",
+        "TMPDIR": "/tmp",
+        "TMP": "/tmp",
+        "TEMP": "/tmp",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "ZEROBOOT_OFFLINE": "1",
     }
+    profile = os.environ.get("ZEROBOOT_CHILD_LIMIT_PROFILE")
+    if profile:
+        env["ZEROBOOT_CHILD_LIMIT_PROFILE"] = profile
+    return env
+
+
+def limit_profile() -> str:
+    return os.environ.get("ZEROBOOT_CHILD_LIMIT_PROFILE", "guest").strip().lower() or "guest"
 
 
 def parse_child_response(data: bytes):
@@ -82,14 +94,12 @@ def child_command(timeout_ms: int) -> list[str]:
     cpu_seconds = max(1, int((timeout_ms + 1999) / 1000))
     memory_kib = max(1, CHILD_MEMORY_BYTES // 1024)
     file_kib = max(1, CHILD_FSIZE_BYTES // 1024)
-    shell = (
-        f"ulimit -t {cpu_seconds}; "
-        f"ulimit -v {memory_kib}; "
-        f"ulimit -n {CHILD_NOFILE}; "
-        f"ulimit -u {CHILD_NPROC}; "
-        f"ulimit -f {file_kib}; "
-        f"exec {python_bin} {child_script}"
-    )
+    shell_parts = [f"ulimit -t {cpu_seconds}", f"ulimit -n {CHILD_NOFILE}", f"ulimit -f {file_kib}"]
+    if limit_profile() != "compat":
+        shell_parts.insert(1, f"ulimit -v {memory_kib}")
+        shell_parts.insert(3, f"ulimit -u {CHILD_NPROC}")
+    shell_parts.append(f"exec {python_bin} {child_script}")
+    shell = "; ".join(shell_parts)
     return ["/bin/sh", "-c", shell]
 
 
@@ -127,20 +137,42 @@ def spawn_child_executor(request_id: str, timeout_ms: int, code: str, stdin_data
         return -1, "internal", b"", str(exc).encode("utf-8", "replace"), 0
 
     if result.stdout.startswith(b"WRK1R "):
-        return parse_child_response(result.stdout)
+        try:
+            return parse_child_response(result.stdout)
+        except Exception as exc:
+            detail = f"malformed child response: {exc}\n".encode("utf-8", "replace")
+            stderr, stderr_truncated = truncate_with_marker(
+                detail + (result.stderr or b""), MAX_STDERR, TRUNCATION_MARKER
+            )
+            return -1, "protocol", b"", stderr, FLAG_STDERR_TRUNCATED if stderr_truncated else 0
 
     stdout, stdout_truncated = truncate_with_marker(
-        result.stdout, MAX_STDOUT, b"\n[truncated]\n"
+        result.stdout, MAX_STDOUT, TRUNCATION_MARKER
     )
-    stderr, stderr_truncated = truncate_with_marker(
-        result.stderr, MAX_STDERR, b"\n[truncated]\n"
-    )
+    if result.returncode is not None and result.returncode < 0:
+        detail = f"child exited by signal {-result.returncode}\n".encode("utf-8", "replace")
+        stderr, stderr_truncated = truncate_with_marker(
+            detail + (result.stderr or b""), MAX_STDERR, TRUNCATION_MARKER
+        )
+        flags = 0
+        if stdout_truncated:
+            flags |= FLAG_STDOUT_TRUNCATED
+        if stderr_truncated:
+            flags |= FLAG_STDERR_TRUNCATED
+        return -1, "internal", stdout, stderr, flags
+    stderr, stderr_truncated = truncate_with_marker(result.stderr, MAX_STDERR, TRUNCATION_MARKER)
     flags = 0
     if stdout_truncated:
         flags |= FLAG_STDOUT_TRUNCATED
     if stderr_truncated:
         flags |= FLAG_STDERR_TRUNCATED
-    return result.returncode or 0, ("ok" if result.returncode == 0 else "runtime"), stdout, stderr, flags
+    return (
+        result.returncode or 0,
+        ("ok" if result.returncode == 0 else "internal"),
+        stdout,
+        stderr,
+        flags,
+    )
 
 
 print("READY", flush=True)
