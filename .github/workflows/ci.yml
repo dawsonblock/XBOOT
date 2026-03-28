@@ -38,39 +38,19 @@ jobs:
       - name: cargo tests
         run: cargo test --locked
 
-  # Verify template manifests before merge - ensures only properly formed templates are accepted
+  # Verify checked-in manifest inventory before merge.
   artifact-verify:
     runs-on: ubuntu-latest
     needs: sanity
     steps:
       - uses: actions/checkout@v4
-      - name: Find template manifests
-        run: find manifests -name '*.json' -type f
-      - name: Validate manifest schema
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate checked-in manifests and lockfiles
         run: |
-          for manifest in manifests/*.json; do
-            if [ -f "$manifest" ]; then
-              echo "Validating $manifest..."
-              python3 -c "
-                import json
-                import sys
-                with open('$manifest') as f:
-                    data = json.load(f)
-                    # Check required fields
-                    required = ['schema_version', 'template_id', 'promotion_channel', 'language']
-                    for field in required:
-                        if field not in data:
-                            print(f'ERROR: $manifest missing required field: {field}')
-                            sys.exit(1)
-                    # In prod, verify promotion state
-                    if data.get('promotion_channel') == 'prod':
-                        if not data.get('manifest_signature'):
-                            print(f'ERROR: prod template $manifest missing signature')
-                            sys.exit(1)
-                    print(f'OK: $manifest')
-              "
-            fi
-          done
+          python -m unittest discover -s tests -p 'test_repo_sanity.py'
+          python -m unittest discover -s tests -p 'test_template_manifest_validator.py'
 
   kvm-integration:
     runs-on: [self-hosted, linux, x64, kvm, ubuntu-22.04]
