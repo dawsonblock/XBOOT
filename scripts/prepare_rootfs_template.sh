@@ -49,12 +49,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+copy_from_mount() {
+  tar --delay-directory-restore --no-same-owner --no-same-permissions -C "$OUTPUT_DIR" -xf -
+}
+
 if [[ "$use_sudo" -eq 1 ]]; then
   sudo mount -o loop,ro -t ext4 "$BASE_ROOTFS" "$MOUNT_DIR"
-  sudo tar -C "$MOUNT_DIR" -cf - . | tar -C "$OUTPUT_DIR" -xf -
+  sudo tar -C "$MOUNT_DIR" -cf - . | copy_from_mount
 else
   mount -o loop,ro -t ext4 "$BASE_ROOTFS" "$MOUNT_DIR"
-  tar -C "$MOUNT_DIR" -cf - . | tar -C "$OUTPUT_DIR" -xf -
+  tar -C "$MOUNT_DIR" -cf - . | copy_from_mount
 fi
 
 echo "prepared rootfs template tree at $OUTPUT_DIR"

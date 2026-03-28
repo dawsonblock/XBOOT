@@ -83,9 +83,9 @@ jobs:
           cp -a /tmp/zb-rootfs-template-base /tmp/zb-rootfs-template-node
           bash scripts/install_node_runtime.sh /tmp/zb-rootfs-template-node /tmp/zb-artifacts
           bash scripts/build_guest_rootfs.sh python /tmp/zb-staging-python --rootfs-template /tmp/zb-rootfs-template-python
-          bash scripts/build_rootfs_image.sh /tmp/zb-staging-python /tmp/rootfs-python.ext4 256
+          bash scripts/build_rootfs_image.sh /tmp/zb-staging-python /tmp/rootfs-python.ext4
           bash scripts/build_guest_rootfs.sh node /tmp/zb-staging-node --rootfs-template /tmp/zb-rootfs-template-node
-          bash scripts/build_rootfs_image.sh /tmp/zb-staging-node /tmp/rootfs-node.ext4 256
+          bash scripts/build_rootfs_image.sh /tmp/zb-staging-node /tmp/rootfs-node.ext4
           mkdir -p /tmp/zb-release/bin /tmp/zb-release/templates/python /tmp/zb-release/templates/node
           cp ./target/release/zeroboot /tmp/zb-release/bin/zeroboot
           ./target/release/zeroboot template /tmp/zb-artifacts/kernel/vmlinux-5.10.223 /tmp/rootfs-python.ext4 /tmp/zb-release/templates/python 20 /init 512

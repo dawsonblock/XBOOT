@@ -149,6 +149,8 @@ make guest-node NODE_ROOTFS_TEMPLATE=/tmp/zb-rootfs-template-node
 make image-node
 make template-node
 
+# build_rootfs_image.sh auto-sizes the ext4 images when size-mib is omitted
+
 # Run locally
 ./target/release/zeroboot serve python:/var/lib/zeroboot/current/templates/python 8080
 

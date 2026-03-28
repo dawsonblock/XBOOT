@@ -81,6 +81,10 @@ make image-node
 make template-node
 ```
 
+`build_rootfs_image.sh` now computes a minimum ext4 size from the populated
+staging tree when `size-mib` is omitted. If you pass an explicit size, it must
+be at least as large as the computed minimum.
+
 `make guest-python` and `make guest-node` build deterministic staging trees under `build/staging/...`.
 `make image-python` and `make image-node` turn those staging trees into ext4 artifacts with `mkfs.ext4 -d`.
 `template.manifest.json` now records language, protocol version, Firecracker version, and sha256 hashes for kernel, rootfs, and snapshot files.
