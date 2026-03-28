@@ -210,8 +210,8 @@ rollback_remote_release() {
   update_remote_deploy_state "$server" "$previous_release" "$failed_release"
   ssh "$server" "sudo systemctl restart zeroboot"
   sleep 3
-  run_remote_ready_check "$server"
-  run_remote_exec_smoke "$server"
+  run_remote_ready_check "$server" || { echo "ROLLBACK FAILED: readiness check failed on $server" >&2; return 1; }
+  run_remote_exec_smoke "$server" || { echo "ROLLBACK FAILED: smoke test failed on $server" >&2; return 1; }
 }
 
 RELEASE_ARCHIVE="$(mktemp -t zeroboot-release.XXXXXX.tgz)"
