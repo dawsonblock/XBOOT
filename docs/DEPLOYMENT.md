@@ -23,7 +23,7 @@ That downloads and verifies:
 - base Ubuntu 22.04 rootfs `ubuntu-22.04.ext4`
 - Node.js runtime tarball `v20.20.2`
 
-The exact URLs and sha256 values are also locked in [runtime-artifacts.lock.json](/Users/dawsonblock/Downloads/XBOOT-main-2/manifests/runtime-artifacts.lock.json).
+The exact URLs and sha256 values are also locked in [runtime-artifacts.lock.json](../manifests/runtime-artifacts.lock.json).
 
 ## Recommended environment
 
