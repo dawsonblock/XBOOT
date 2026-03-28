@@ -9,6 +9,9 @@ mod vmm;
 
 use anyhow::{bail, Context, Result};
 use axum::extract::DefaultBodyLimit;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
@@ -20,9 +23,14 @@ use api::handlers::{
 };
 use config::{AuthMode, ServerConfig};
 use protocol::GuestRequest;
-use template_manifest::{ManifestPolicy, VerificationMode};
+use template_manifest::ManifestPolicy;
+#[cfg(target_os = "linux")]
+use template_manifest::VerificationMode;
 use vmm::firecracker;
-use vmm::kvm::{create_snapshot_memfd, ForkedVm, VmSnapshot};
+#[cfg(target_os = "linux")]
+use vmm::kvm::create_snapshot_memfd;
+use vmm::kvm::{ForkedVm, VmSnapshot};
+#[cfg(target_os = "linux")]
 use vmm::vmstate;
 
 fn main() -> Result<()> {
@@ -34,6 +42,7 @@ fn main() -> Result<()> {
         "serve" => cmd_serve(&args[2..]),
         "test-exec" => cmd_test_exec(&args[2..]),
         "verify-startup" => cmd_verify_startup(&args[2..]),
+        "promote-template" => cmd_promote_template(&args[2..]),
         "sign" => cmd_sign(&args[2..]),
         "keygen" => cmd_keygen(&args[2..]),
         _ => {
@@ -43,11 +52,47 @@ fn main() -> Result<()> {
             eprintln!("  test-exec <workdir> [language] <code>");
             eprintln!("  serve <workdir>[,lang:workdir2,...] [port]");
             eprintln!("  verify-startup <workdir>[,lang:workdir2,...] [--release-root <path>]");
+            eprintln!("  promote-template <manifest> --channel <dev|staging|prod> --key <path> --key-id <id> [--out <path>] [--receipt <path>]");
             eprintln!("  sign <key> <manifest>");
             eprintln!("  keygen");
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct PromotionReceipt {
+    manifest_path: String,
+    template_id: Option<String>,
+    artifact_set_id: Option<String>,
+    previous_channel: Option<String>,
+    promotion_channel: String,
+    signer_key_id: String,
+    signed_fields: Vec<String>,
+    signature_sha256: String,
+    promoted_at_unix_ms: u64,
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("atomic write target must have a parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temp file for {}", path.display()))?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.as_file().sync_all().ok();
+    tmp.persist(path)
+        .map_err(|e| anyhow::anyhow!("persist {}: {}", path.display(), e.error))?;
+    Ok(())
+}
+
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Build a ManifestPolicy from optional config.
@@ -685,8 +730,6 @@ fn print_percentiles(label: &str, times: &[f64]) {
 }
 
 fn cmd_keygen(args: &[String]) -> Result<()> {
-    use std::io::Write;
-
     let (pkcs8, public_key) = signing::generate_key_pair()?;
     let key_id = signing::get_key_id(&public_key);
 
@@ -717,6 +760,153 @@ fn cmd_keygen(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn cmd_promote_template(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!(
+            "Usage: zeroboot promote-template <manifest> --channel <dev|staging|prod> --key <path> --key-id <id> [--out <path>] [--receipt <path>]"
+        );
+    }
+
+    let manifest_path = Path::new(&args[0]);
+    let mut channel = None;
+    let mut key_path = None;
+    let mut key_id = None;
+    let mut out_path = None;
+    let mut receipt_path = None;
+
+    let mut idx = 1usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--channel" => {
+                let value = args.get(idx + 1).context("--channel requires a value")?;
+                channel = Some(value.to_string());
+                idx += 2;
+            }
+            "--key" => {
+                let value = args.get(idx + 1).context("--key requires a path")?;
+                key_path = Some(value.to_string());
+                idx += 2;
+            }
+            "--key-id" => {
+                let value = args.get(idx + 1).context("--key-id requires a value")?;
+                key_id = Some(value.to_string());
+                idx += 2;
+            }
+            "--out" => {
+                let value = args.get(idx + 1).context("--out requires a path")?;
+                out_path = Some(value.to_string());
+                idx += 2;
+            }
+            "--receipt" => {
+                let value = args.get(idx + 1).context("--receipt requires a path")?;
+                receipt_path = Some(value.to_string());
+                idx += 2;
+            }
+            other => bail!("unexpected argument: {}", other),
+        }
+    }
+
+    let channel = channel.context("--channel is required")?;
+    if !matches!(channel.as_str(), "dev" | "staging" | "prod") {
+        bail!("--channel must be one of: dev, staging, prod");
+    }
+    let key_path_value = key_path.context("--key is required")?;
+    let key_path = Path::new(&key_path_value);
+    let key_id = key_id.context("--key-id is required")?;
+    let workdir = manifest_path
+        .parent()
+        .context("manifest path must live inside a template workdir")?;
+
+    let mut policy = ManifestPolicy::dev();
+    policy.require_hashes = true;
+    let existing_manifest = template_manifest::verify_template_artifacts_with_policy(
+        workdir, &policy,
+    )
+    .with_context(|| {
+        format!(
+            "pre-promotion verification failed for {}",
+            manifest_path.display()
+        )
+    })?;
+    if existing_manifest.schema_version != Some(1) {
+        bail!(
+            "promote-template only supports schema_version=1, got {:?}",
+            existing_manifest.schema_version
+        );
+    }
+
+    let key_bytes = std::fs::read(key_path)?;
+    let public_key = signing::export_public_key(&key_bytes)?;
+    let derived_key_id = signing::get_key_id(&public_key);
+    if key_id != derived_key_id {
+        bail!(
+            "provided --key-id does not match key material: expected {}, got {}",
+            derived_key_id,
+            key_id
+        );
+    }
+
+    let manifest_json = std::fs::read_to_string(manifest_path)?;
+    let mut manifest_value: serde_json::Value = serde_json::from_str(&manifest_json)?;
+    let previous_channel = manifest_value
+        .get("promotion_channel")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    manifest_value["promotion_channel"] = serde_json::json!(channel);
+    manifest_value["signer_key_id"] = serde_json::json!(key_id);
+    manifest_value["manifest_signature"] = serde_json::Value::Null;
+    manifest_value["manifest_signed_fields"] =
+        serde_json::json!(signing::required_manifest_signed_fields_vec());
+
+    let prepared_json = serde_json::to_string(&manifest_value)?;
+    let (signature, _) = signing::sign_manifest_with_required_fields(&key_bytes, &prepared_json)?;
+    manifest_value["manifest_signature"] = serde_json::json!(signature);
+
+    let final_json = serde_json::to_string_pretty(&manifest_value)?;
+    signing::verify_manifest_signature(
+        &final_json,
+        &key_id,
+        &signature,
+        Some(&signing::Keyring::from_keys(vec![signing::TrustedKey {
+            key_id: key_id.clone(),
+            algorithm: signing::SIG_ALGORITHM_ED25519.to_string(),
+            public_key,
+            enabled: true,
+            description: Some("promotion verifier".to_string()),
+        }])),
+    )?;
+
+    let out_path = out_path.as_deref().map(Path::new).unwrap_or(manifest_path);
+    write_bytes_atomic(out_path, final_json.as_bytes())?;
+
+    let signature_sha256 = {
+        let signature_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &signature)
+                .context("generated signature was not valid base64")?;
+        hex::encode(Sha256::digest(signature_bytes))
+    };
+    let receipt = PromotionReceipt {
+        manifest_path: out_path.display().to_string(),
+        template_id: existing_manifest.template_id.clone(),
+        artifact_set_id: existing_manifest.artifact_set_id.clone(),
+        previous_channel,
+        promotion_channel: channel,
+        signer_key_id: key_id.clone(),
+        signed_fields: signing::required_manifest_signed_fields_vec(),
+        signature_sha256,
+        promoted_at_unix_ms: current_unix_ms(),
+    };
+    if let Some(path) = receipt_path.as_deref().map(Path::new) {
+        write_bytes_atomic(path, serde_json::to_vec_pretty(&receipt)?.as_slice())?;
+        println!("promotion receipt written to {}", path.display());
+    } else {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+    }
+
+    println!("promoted manifest written to {}", out_path.display());
+    Ok(())
+}
+
 fn cmd_sign(args: &[String]) -> Result<()> {
     if args.len() < 2 {
         bail!("Usage: zeroboot sign <key_path> <manifest_path>");
@@ -728,30 +918,7 @@ fn cmd_sign(args: &[String]) -> Result<()> {
     let key_bytes = std::fs::read(key_path)?;
     let manifest_json = std::fs::read_to_string(manifest_path)?;
 
-    // Sign all core identity and artifact fields for production use
-    let signed_fields = [
-        "schema_version",
-        "template_id",
-        "build_id",
-        "artifact_set_id",
-        "promotion_channel",
-        "language",
-        "kernel_path",
-        "kernel_sha256",
-        "rootfs_path",
-        "rootfs_sha256",
-        "init_path",
-        "snapshot_state_path",
-        "snapshot_state_sha256",
-        "snapshot_mem_path",
-        "snapshot_mem_sha256",
-        "firecracker_version",
-        "firecracker_binary_sha256",
-        "protocol_version",
-        "vcpu_count",
-        "mem_size_mib",
-    ];
-    let (signature, _) = signing::sign_manifest(&key_bytes, &manifest_json, &signed_fields)?;
+    let (signature, _) = signing::sign_manifest_with_required_fields(&key_bytes, &manifest_json)?;
 
     // Get key ID
     let public_key = signing::export_public_key(&key_bytes)?;
@@ -761,18 +928,19 @@ fn cmd_sign(args: &[String]) -> Result<()> {
     let mut manifest: serde_json::Value = serde_json::from_str(&manifest_json)?;
     manifest["signer_key_id"] = serde_json::json!(key_id);
     manifest["manifest_signature"] = serde_json::json!(signature);
-    manifest["manifest_signed_fields"] = serde_json::json!(signed_fields);
+    manifest["manifest_signed_fields"] =
+        serde_json::json!(signing::required_manifest_signed_fields_vec());
 
     // Write signed manifest
     let signed_json = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(manifest_path, signed_json)?;
+    write_bytes_atomic(manifest_path, signed_json.as_bytes())?;
 
     println!("Manifest signed with key ID: {}", key_id);
     println!("Signature: {}", signature);
     println!(
         "Signed fields ({}): {:?}",
-        signed_fields.len(),
-        signed_fields
+        signing::REQUIRED_MANIFEST_SIGNED_FIELDS.len(),
+        signing::REQUIRED_MANIFEST_SIGNED_FIELDS
     );
 
     Ok(())

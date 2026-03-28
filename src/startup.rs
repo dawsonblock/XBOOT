@@ -5,7 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::ServerConfig;
+use crate::config::{AuthMode, ServerConfig};
 use crate::template_manifest::{self, ManifestPolicy};
 
 #[derive(Debug, Clone)]
@@ -55,6 +55,8 @@ pub fn verify_startup(
 ) -> Result<()> {
     config.validate_startup()?;
     verify_release_root(release_root)?;
+    verify_template_roots(specs)?;
+    verify_auth_and_logging_paths(config)?;
     verify_kvm()?;
     verify_cgroup_mode()?;
     verify_firecracker_binary(config)?;
@@ -108,6 +110,67 @@ fn verify_release_root(release_root: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+fn verify_template_roots(specs: &[ParsedTemplateSpec]) -> Result<()> {
+    for spec in specs {
+        if !spec.workdir.is_dir() {
+            bail!(
+                "template workdir for '{}' does not exist or is not a directory: {}",
+                spec.language,
+                spec.workdir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_readable_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("{} path is not accessible: {}", label, path.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a file: {}", label, path.display());
+    }
+    std::fs::File::open(path)
+        .with_context(|| format!("{} is not readable: {}", label, path.display()))?;
+    Ok(())
+}
+
+fn verify_writable_directory(path: &Path, label: &str) -> Result<()> {
+    if !path.is_dir() {
+        bail!("{} is not a directory: {}", label, path.display());
+    }
+    let probe = tempfile::NamedTempFile::new_in(path)
+        .with_context(|| format!("{} is not writable: {}", label, path.display()))?;
+    drop(probe);
+    Ok(())
+}
+
+fn verify_auth_and_logging_paths(config: &ServerConfig) -> Result<()> {
+    if matches!(config.auth_mode, AuthMode::Prod) {
+        verify_readable_file(&config.api_keys_file, "api keys file")?;
+        verify_readable_file(&config.api_key_pepper_file, "api key pepper file")?;
+    }
+
+    if config.artifacts.require_template_signatures {
+        let keyring_path = config.artifacts.keyring_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("signature verification requires ZEROBOOT_KEYRING_PATH")
+        })?;
+        verify_readable_file(keyring_path, "keyring file")?;
+    }
+
+    let log_dir = config
+        .logging
+        .path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("request log path must have a parent directory"))?;
+    if !log_dir.exists() {
+        std::fs::create_dir_all(log_dir)
+            .with_context(|| format!("create request log directory {}", log_dir.display()))?;
+    }
+    verify_writable_directory(log_dir, "request log directory")?;
+
+    Ok(())
+}
+
 fn verify_kvm() -> Result<()> {
     let kvm = Path::new("/dev/kvm");
     if !kvm.exists() {
@@ -137,21 +200,38 @@ pub fn resolve_firecracker_binary() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("firecracker"))
 }
 
-fn verify_firecracker_binary(config: &ServerConfig) -> Result<()> {
+pub fn resolved_firecracker_binary() -> Result<PathBuf> {
     let binary = resolve_firecracker_binary();
-    let version_output = Command::new(&binary)
+    resolve_executable(&binary)
+}
+
+fn verify_firecracker_binary(config: &ServerConfig) -> Result<()> {
+    let resolved_binary = resolved_firecracker_binary()?;
+    let version_output = Command::new(&resolved_binary)
         .arg("--version")
         .output()
-        .with_context(|| format!("run {} --version", binary.display()))?;
+        .with_context(|| format!("run {} --version", resolved_binary.display()))?;
     if !version_output.status.success() {
         bail!(
             "failed to query Firecracker version from {}",
-            binary.display()
+            resolved_binary.display()
         );
     }
-    let version = String::from_utf8_lossy(&version_output.stdout)
-        .trim()
-        .to_string();
+    let version = if version_output.stdout.is_empty() {
+        String::from_utf8_lossy(&version_output.stderr)
+            .trim()
+            .to_string()
+    } else {
+        String::from_utf8_lossy(&version_output.stdout)
+            .trim()
+            .to_string()
+    };
+    if version.is_empty() {
+        bail!(
+            "Firecracker version probe returned no output from {}",
+            resolved_binary.display()
+        );
+    }
     if let Some(expected) = config.artifacts.allowed_firecracker_version.as_deref() {
         if version != expected {
             bail!(
@@ -167,8 +247,8 @@ fn verify_firecracker_binary(config: &ServerConfig) -> Result<()> {
         .allowed_firecracker_binary_sha256
         .as_deref()
     {
-        let actual_hash = template_manifest::sha256_hex(&binary)
-            .with_context(|| format!("sha256 {}", binary.display()))?;
+        let actual_hash = template_manifest::sha256_hex(&resolved_binary)
+            .with_context(|| format!("sha256 {}", resolved_binary.display()))?;
         if actual_hash != expected_hash.to_ascii_lowercase() {
             bail!(
                 "Firecracker binary sha256 mismatch: expected {}, got {}",
@@ -179,6 +259,22 @@ fn verify_firecracker_binary(config: &ServerConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn resolve_executable(binary: &Path) -> Result<PathBuf> {
+    if binary.components().count() > 1 || binary.is_absolute() {
+        return Ok(binary.to_path_buf());
+    }
+
+    let path_env = env::var_os("PATH").ok_or_else(|| anyhow::anyhow!("PATH is not set"))?;
+    for dir in env::split_paths(&path_env) {
+        let candidate = dir.join(binary);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    bail!("executable not found in PATH: {}", binary.display());
 }
 
 fn ensure_disk_watermarks(config: &ServerConfig, specs: &[ParsedTemplateSpec]) -> Result<()> {

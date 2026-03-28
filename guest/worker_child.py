@@ -21,6 +21,10 @@ FLAG_STDERR_TRUNCATED = 2
 TRUNCATION_MARKER = b"\n[truncated]\n"
 
 
+def limit_profile() -> str:
+    return os.environ.get("ZEROBOOT_CHILD_LIMIT_PROFILE", "guest").strip().lower() or "guest"
+
+
 def truncate_with_marker(data: bytes, limit: int):
     if len(data) <= limit:
         return data, False
@@ -42,9 +46,12 @@ def timeout_handler(_signum, _frame):
     raise TimeoutError("execution timed out")
 
 
-def apply_limits(timeout_ms: int, limits: dict) -> None:
+def apply_limits(timeout_ms: int, limits: dict) -> list[str]:
     if resource is None:
-        return
+        return []
+
+    failures: list[str] = []
+    profile = limit_profile()
 
     def clamp_and_set(kind, desired):
         soft, hard = resource.getrlimit(kind)
@@ -58,10 +65,8 @@ def apply_limits(timeout_ms: int, limits: dict) -> None:
             target_soft = min(target, soft) if soft < target else target
         try:
             resource.setrlimit(kind, (target_soft, target))
-        except (ValueError, OSError):
-            # Some developer hosts do not allow tightening every limit locally.
-            # The Linux guest path still applies shell-level ulimit caps first.
-            pass
+        except (ValueError, OSError) as exc:
+            failures.append(f"{kind}:{exc}")
 
     cpu_seconds = max(1, int((timeout_ms + 1999) / 1000))
     memory_bytes = int(limits.get("memory_bytes", 512 * 1024 * 1024))
@@ -69,12 +74,13 @@ def apply_limits(timeout_ms: int, limits: dict) -> None:
     nproc = int(limits.get("nproc", 16))
     fsize_bytes = int(limits.get("fsize_bytes", 2 * 1024 * 1024))
     clamp_and_set(resource.RLIMIT_CPU, cpu_seconds)
-    if hasattr(resource, "RLIMIT_AS"):
+    if profile != "compat" and hasattr(resource, "RLIMIT_AS"):
         clamp_and_set(resource.RLIMIT_AS, memory_bytes)
     clamp_and_set(resource.RLIMIT_NOFILE, nofile)
-    if hasattr(resource, "RLIMIT_NPROC"):
+    if profile != "compat" and hasattr(resource, "RLIMIT_NPROC"):
         clamp_and_set(resource.RLIMIT_NPROC, nproc)
     clamp_and_set(resource.RLIMIT_FSIZE, fsize_bytes)
+    return failures
 
 
 def directory_size(path: str) -> int:
@@ -89,41 +95,53 @@ def directory_size(path: str) -> int:
 
 
 def main():
-    payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
-    request_id = payload["request_id"].encode("utf-8", "replace")
-    timeout_ms = max(1, int(payload.get("timeout_ms", 30000)))
-    code = str(payload.get("code", ""))
-    stdin_data = str(payload.get("stdin", ""))
-    limits = payload.get("limits", {})
-    max_stdout = int(limits.get("stdout_bytes", 64 * 1024))
-    max_stderr = int(limits.get("stderr_bytes", 64 * 1024))
-    max_tmp_bytes = int(limits.get("tmp_bytes", 16 * 1024 * 1024))
-
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.setitimer(signal.ITIMER_REAL, timeout_ms / 1000.0)
-    apply_limits(timeout_ms, limits)
-
-    scratch = tempfile.mkdtemp(prefix="zeroboot-")
-    old_environ = dict(os.environ)
-    old_stdin = sys.stdin
+    request_id = b"error"
+    max_stdout = 64 * 1024
+    max_stderr = 64 * 1024
     stdout_io = io.StringIO()
     stderr_io = io.StringIO()
-    exit_code = 0
-    error_type = "ok"
+    old_environ = dict(os.environ)
+    old_stdin = sys.stdin
+    scratch = None
+    exit_code = -1
+    error_type = "internal"
+
     try:
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+        request_id = str(payload.get("request_id", "error")).encode("utf-8", "replace")
+        timeout_ms = max(1, int(payload.get("timeout_ms", 30000)))
+        code = str(payload.get("code", ""))
+        stdin_data = str(payload.get("stdin", ""))
+        limits = payload.get("limits", {})
+        max_stdout = int(limits.get("stdout_bytes", max_stdout))
+        max_stderr = int(limits.get("stderr_bytes", max_stderr))
+        max_tmp_bytes = int(limits.get("tmp_bytes", 16 * 1024 * 1024))
+
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.setitimer(signal.ITIMER_REAL, timeout_ms / 1000.0)
+        limit_failures = apply_limits(timeout_ms, limits)
+
+        scratch = tempfile.mkdtemp(prefix="zeroboot-")
         os.environ.clear()
         os.environ.update(
             {
                 "HOME": scratch,
                 "TMPDIR": scratch,
+                "TMP": scratch,
+                "TEMP": scratch,
                 "ZEROBOOT_TMPDIR": scratch,
                 "ZEROBOOT_OFFLINE": "1",
+                "ZEROBOOT_CHILD_LIMIT_PROFILE": limit_profile(),
             }
         )
         sys.stdin = io.StringIO(stdin_data)
         globals_dict = {"__name__": "__main__", "__builtins__": builtins}
+        exit_code = 0
+        error_type = "ok"
         with contextlib.redirect_stdout(stdout_io), contextlib.redirect_stderr(stderr_io):
             exec(compile(code, "<zeroboot>", "exec"), globals_dict, globals_dict)
+        if limit_failures:
+            stderr_io.write("limit setup degraded: " + ", ".join(limit_failures) + "\n")
         if directory_size(scratch) > max_tmp_bytes:
             exit_code = 1
             error_type = "runtime"
@@ -133,8 +151,9 @@ def main():
         error_type = "timeout"
         stderr_io.write("execution timed out\n")
     except BaseException:
-        exit_code = 1
-        error_type = "runtime"
+        if error_type == "ok":
+            exit_code = 1
+            error_type = "runtime"
         traceback.print_exc(file=stderr_io)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
@@ -142,7 +161,8 @@ def main():
         os.environ.clear()
         os.environ.update(old_environ)
         gc.collect()
-        shutil.rmtree(scratch, ignore_errors=True)
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
 
     stdout_bytes, stdout_truncated = truncate_with_marker(
         stdout_io.getvalue().encode("utf-8", "replace"), max_stdout

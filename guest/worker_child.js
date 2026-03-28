@@ -8,6 +8,11 @@ const FLAG_STDOUT_TRUNCATED = 1;
 const FLAG_STDERR_TRUNCATED = 2;
 const TRUNCATION_MARKER = Buffer.from('\n[truncated]\n', 'utf8');
 
+function limitProfile() {
+  const value = String(process.env.ZEROBOOT_CHILD_LIMIT_PROFILE || 'guest').trim().toLowerCase();
+  return value || 'guest';
+}
+
 function truncateWithMarker(buf, max) {
   if (buf.length <= max) return [buf, false];
   if (max <= TRUNCATION_MARKER.length) return [TRUNCATION_MARKER.subarray(0, max), true];
@@ -36,58 +41,74 @@ function directorySize(root) {
 }
 
 function main() {
-  const payload = JSON.parse(fs.readFileSync(0, 'utf8'));
-  const requestId = Buffer.from(String(payload.request_id || ''), 'utf8');
-  const timeoutMs = Math.max(1, Number(payload.timeout_ms || 30000));
-  const code = String(payload.code || '');
-  const stdinData = String(payload.stdin || '');
-  const limits = payload.limits || {};
-  const maxStdout = Number(limits.stdout_bytes || 64 * 1024);
-  const maxStderr = Number(limits.stderr_bytes || 64 * 1024);
-  const maxTmpBytes = Number(limits.tmp_bytes || 16 * 1024 * 1024);
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'zeroboot-'));
-
-  let exitCode = 0;
-  let errorType = 'ok';
+  let requestId = Buffer.from('error', 'utf8');
+  let exitCode = -1;
+  let errorType = 'internal';
+  let maxStdout = 64 * 1024;
+  let maxStderr = 64 * 1024;
+  let maxTmpBytes = 16 * 1024 * 1024;
+  let scratch = null;
   const stdoutParts = [];
   const stderrParts = [];
-
-  const sandbox = {
-    console: {
-      log: (...args) => stdoutParts.push(args.join(' ') + '\n'),
-      error: (...args) => stderrParts.push(args.join(' ') + '\n'),
-    },
-    TextEncoder,
-    TextDecoder,
-    stdin: stdinData,
-    setTimeout,
-    clearTimeout,
-    Math,
-    Date,
-    JSON,
-    Array,
-    Object,
-    String,
-    Number,
-    Boolean,
-    RegExp,
-    Map,
-    Set,
-    Promise,
-    Error,
-    TypeError,
-    SyntaxError,
-    RangeError,
-    ReferenceError,
-  };
+  const originalEnv = process.env;
 
   try {
-    process.env = {
+    const payload = JSON.parse(fs.readFileSync(0, 'utf8'));
+    requestId = Buffer.from(String(payload.request_id || 'error'), 'utf8');
+    const timeoutMs = Math.max(1, Number(payload.timeout_ms || 30000));
+    const code = String(payload.code || '');
+    const stdinData = String(payload.stdin || '');
+    const limits = payload.limits || {};
+    maxStdout = Number(limits.stdout_bytes || maxStdout);
+    maxStderr = Number(limits.stderr_bytes || maxStderr);
+    maxTmpBytes = Number(limits.tmp_bytes || maxTmpBytes);
+    scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'zeroboot-'));
+
+    const childEnv = {
       HOME: scratch,
       TMPDIR: scratch,
+      TMP: scratch,
+      TEMP: scratch,
       ZEROBOOT_TMPDIR: scratch,
       ZEROBOOT_OFFLINE: '1',
+      ZEROBOOT_CHILD_LIMIT_PROFILE: limitProfile(),
     };
+    process.env = childEnv;
+
+    const sandbox = {
+      console: {
+        log: (...args) => stdoutParts.push(args.join(' ') + '\n'),
+        error: (...args) => stderrParts.push(args.join(' ') + '\n'),
+      },
+      TextEncoder,
+      TextDecoder,
+      stdin: stdinData,
+      process: {
+        env: { ...childEnv },
+      },
+      setTimeout,
+      clearTimeout,
+      Math,
+      Date,
+      JSON,
+      Array,
+      Object,
+      String,
+      Number,
+      Boolean,
+      RegExp,
+      Map,
+      Set,
+      Promise,
+      Error,
+      TypeError,
+      SyntaxError,
+      RangeError,
+      ReferenceError,
+    };
+
+    exitCode = 0;
+    errorType = 'ok';
     const script = new vm.Script(code, { filename: '<zeroboot>' });
     script.runInNewContext(sandbox, { timeout: timeoutMs });
     if (directorySize(scratch) > maxTmpBytes) {
@@ -96,11 +117,23 @@ function main() {
       stderrParts.push('temporary directory quota exceeded\n');
     }
   } catch (err) {
-    exitCode = /Script execution timed out/.test(String(err)) ? -1 : 1;
-    errorType = exitCode === -1 ? 'timeout' : 'runtime';
-    stderrParts.push((err && err.stack) ? err.stack + '\n' : String(err) + '\n');
+    const text = String(err);
+    if (/Script execution timed out/.test(text)) {
+      exitCode = -1;
+      errorType = 'timeout';
+    } else if (errorType === 'ok') {
+      exitCode = 1;
+      errorType = 'runtime';
+    } else {
+      exitCode = -1;
+      errorType = 'internal';
+    }
+    stderrParts.push((err && err.stack) ? err.stack + '\n' : text + '\n');
   } finally {
-    fs.rmSync(scratch, { recursive: true, force: true });
+    process.env = originalEnv;
+    if (scratch) {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
   }
 
   let stdout = Buffer.from(stdoutParts.join(''), 'utf8');

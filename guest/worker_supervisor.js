@@ -71,13 +71,26 @@ function parseChildResponse(data) {
 }
 
 function minimalChildEnv() {
-  return {
+  const env = {
     PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
     HOME: '/tmp',
+    TMPDIR: '/tmp',
+    TMP: '/tmp',
+    TEMP: '/tmp',
     LANG: 'C.UTF-8',
     LC_ALL: 'C.UTF-8',
     ZEROBOOT_OFFLINE: '1',
   };
+  const profile = process.env.ZEROBOOT_CHILD_LIMIT_PROFILE;
+  if (profile) {
+    env.ZEROBOOT_CHILD_LIMIT_PROFILE = profile;
+  }
+  return env;
+}
+
+function limitProfile() {
+  const value = String(process.env.ZEROBOOT_CHILD_LIMIT_PROFILE || 'guest').trim().toLowerCase();
+  return value || 'guest';
 }
 
 function childCommand(timeoutMs) {
@@ -87,13 +100,15 @@ function childCommand(timeoutMs) {
   const fileKiB = Math.max(1, Math.floor(CHILD_FSIZE_BYTES / 1024));
   const shell = [
     `ulimit -t ${cpuSeconds}`,
-    `ulimit -v ${memoryKiB}`,
     `ulimit -n ${CHILD_NOFILE}`,
-    `ulimit -u ${CHILD_NPROC}`,
     `ulimit -f ${fileKiB}`,
-    `exec "${process.execPath}" "${childScript}"`,
-  ].join('; ');
-  return ['/bin/sh', ['-c', shell]];
+  ];
+  if (limitProfile() !== 'compat') {
+    shell.push(`ulimit -v ${memoryKiB}`);
+    shell.push(`ulimit -u ${CHILD_NPROC}`);
+  }
+  shell.push(`exec "${process.execPath}" "${childScript}"`);
+  return ['/bin/sh', ['-c', shell.join('; ')]];
 }
 
 function spawnChildExecutor(requestId, timeoutMs, code, stdinData) {
@@ -129,17 +144,34 @@ function spawnChildExecutor(requestId, timeoutMs, code, stdinData) {
     return [-1, 'internal', Buffer.alloc(0), Buffer.from(String(result.error.message || result.error), 'utf8'), 0];
   }
   if (result.stdout && result.stdout.toString('utf8').startsWith('WRK1R ')) {
-    return parseChildResponse(result.stdout);
+    try {
+      return parseChildResponse(result.stdout);
+    } catch (err) {
+      const [stderr, stderrTruncated] = truncateWithMarker(
+        Buffer.from(`malformed child response: ${String(err.message || err)}\n`, 'utf8'),
+        MAX_STDERR,
+      );
+      return [-1, 'protocol', Buffer.alloc(0), stderr, stderrTruncated ? FLAG_STDERR_TRUNCATED : 0];
+    }
   }
 
   let flags = 0;
   let stdout;
   let stderr;
+  let stdoutTruncated;
+  let stderrTruncated;
   [stdout, stdoutTruncated] = truncateWithMarker(result.stdout || Buffer.alloc(0), MAX_STDOUT);
   [stderr, stderrTruncated] = truncateWithMarker(result.stderr || Buffer.alloc(0), MAX_STDERR);
+  if (result.signal) {
+    const detail = Buffer.from(`child exited by signal ${result.signal}\n`, 'utf8');
+    [stderr, stderrTruncated] = truncateWithMarker(Buffer.concat([stderr, detail]), MAX_STDERR);
+    if (stdoutTruncated) flags |= FLAG_STDOUT_TRUNCATED;
+    if (stderrTruncated) flags |= FLAG_STDERR_TRUNCATED;
+    return [-1, 'internal', stdout, stderr, flags];
+  }
   if (stdoutTruncated) flags |= FLAG_STDOUT_TRUNCATED;
   if (stderrTruncated) flags |= FLAG_STDERR_TRUNCATED;
-  return [result.status || 0, result.status === 0 ? 'ok' : 'runtime', stdout, stderr, flags];
+  return [result.status || -1, result.status === 0 ? 'ok' : 'internal', stdout, stderr, flags];
 }
 
 process.stdout.write('READY\n');

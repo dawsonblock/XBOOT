@@ -323,6 +323,17 @@ pub fn verify_template_artifacts_with_policy(
         }
 
         // 6. Require signatures if configured
+        if manifest.manifest_signature.is_some()
+            || manifest.signer_key_id.is_some()
+            || manifest.manifest_signed_fields.is_some()
+        {
+            let signed_fields = manifest
+                .manifest_signed_fields
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("signed template missing manifest_signed_fields"))?;
+            signing::validate_manifest_signed_fields(signed_fields)?;
+        }
+
         if policy.require_signatures {
             if manifest.manifest_signature.is_none() {
                 bail!("prod mode requires template signatures but none present");
@@ -333,6 +344,10 @@ pub fn verify_template_artifacts_with_policy(
                 anyhow::anyhow!("template has signature but missing signer_key_id")
             })?;
             let signature = manifest.manifest_signature.as_ref().unwrap();
+            let signed_fields = manifest.manifest_signed_fields.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("template has signature but missing manifest_signed_fields")
+            })?;
+            signing::validate_manifest_signed_fields(signed_fields)?;
 
             // Serialize manifest to JSON for verification
             let manifest_json = serde_json::to_string(&manifest)?;
@@ -464,28 +479,24 @@ pub fn verify_template_artifacts_with_policy(
     } else {
         resolve_path(workdir, &manifest.kernel_path)
     };
-    if kernel_path.exists() || manifest.kernel_sha256.is_some() {
-        verify_hash_if_present(
-            &kernel_path,
-            manifest.kernel_sha256.as_deref(),
-            policy.require_hashes,
-            "kernel",
-        )?;
-    }
+    verify_hash_if_present(
+        &kernel_path,
+        manifest.kernel_sha256.as_deref(),
+        policy.require_hashes,
+        "kernel",
+    )?;
 
     let rootfs_path = if mode == VerificationMode::Prod {
         resolve_path_confined(workdir, &manifest.rootfs_path)?
     } else {
         resolve_path(workdir, &manifest.rootfs_path)
     };
-    if rootfs_path.exists() || manifest.rootfs_sha256.is_some() {
-        verify_hash_if_present(
-            &rootfs_path,
-            manifest.rootfs_sha256.as_deref(),
-            policy.require_hashes,
-            "rootfs",
-        )?;
-    }
+    verify_hash_if_present(
+        &rootfs_path,
+        manifest.rootfs_sha256.as_deref(),
+        policy.require_hashes,
+        "rootfs",
+    )?;
 
     Ok(manifest)
 }
@@ -748,6 +759,174 @@ mod strict_enforcement_tests {
         assert!(
             err.contains("schema_version"),
             "expected schema_version error: {}",
+            err
+        );
+    }
+}
+
+#[cfg(test)]
+mod signature_enforcement_tests {
+    use super::*;
+    use crate::signing;
+    use tempfile::TempDir;
+
+    fn write_template_files(workdir: &Path) -> Result<()> {
+        std::fs::write(workdir.join("kernel"), b"kernel-bytes")?;
+        std::fs::write(workdir.join("rootfs.ext4"), b"rootfs-bytes")?;
+        std::fs::write(workdir.join("snapshot.state"), b"state-bytes")?;
+        std::fs::write(workdir.join("snapshot.mem"), b"mem-bytes")?;
+        Ok(())
+    }
+
+    fn create_signed_manifest(
+        workdir: &Path,
+        channel: &str,
+        sign_manifest: bool,
+    ) -> Result<Option<PathBuf>> {
+        write_template_files(workdir)?;
+        let kernel_path = workdir.join("kernel");
+        let rootfs_path = workdir.join("rootfs.ext4");
+        let state_path = workdir.join("snapshot.state");
+        let mem_path = workdir.join("snapshot.mem");
+
+        let mut manifest = serde_json::json!({
+            "schema_version": 1,
+            "template_id": "tpl-prod",
+            "build_id": "build-prod",
+            "artifact_set_id": "artifact-prod",
+            "promotion_channel": channel,
+            "language": "python",
+            "kernel_path": "kernel",
+            "kernel_sha256": sha256_hex(&kernel_path)?,
+            "rootfs_path": "rootfs.ext4",
+            "rootfs_sha256": sha256_hex(&rootfs_path)?,
+            "init_path": "/init",
+            "mem_size_mib": 512,
+            "snapshot_state_path": "snapshot.state",
+            "snapshot_state_bytes": std::fs::metadata(&state_path)?.len(),
+            "snapshot_state_sha256": sha256_hex(&state_path)?,
+            "snapshot_mem_path": "snapshot.mem",
+            "snapshot_mem_bytes": std::fs::metadata(&mem_path)?.len(),
+            "snapshot_mem_sha256": sha256_hex(&mem_path)?,
+            "firecracker_version": "1.12.0",
+            "firecracker_binary_sha256": "fc-sha",
+            "protocol_version": "ZB1",
+            "vcpu_count": 1,
+            "created_at_unix_ms": 1234567890u64,
+            "signer_key_id": null,
+            "manifest_signature": null,
+            "manifest_signed_fields": null
+        });
+
+        let mut keyring_path = None;
+        if sign_manifest {
+            let (private_key, public_key) = signing::generate_key_pair()?;
+            let key_id = signing::get_key_id(&public_key);
+            manifest["signer_key_id"] = serde_json::json!(key_id.clone());
+            manifest["manifest_signed_fields"] =
+                serde_json::json!(signing::required_manifest_signed_fields_vec());
+            let prepared = serde_json::to_string(&manifest)?;
+            let (signature, _) =
+                signing::sign_manifest_with_required_fields(&private_key, &prepared)?;
+            manifest["manifest_signature"] = serde_json::json!(signature);
+
+            let keyring = serde_json::json!({
+                "keys": [{
+                    "key_id": key_id,
+                    "algorithm": signing::SIG_ALGORITHM_ED25519,
+                    "public_key": signing::format_public_key_base64(&public_key),
+                    "enabled": true,
+                    "description": "test signer"
+                }]
+            });
+            let path = workdir.join("keyring.json");
+            std::fs::write(&path, serde_json::to_vec_pretty(&keyring)?)?;
+            keyring_path = Some(path);
+        }
+
+        std::fs::write(
+            workdir.join(TEMPLATE_MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        Ok(keyring_path)
+    }
+
+    fn prod_policy<'a>(keyring_path: Option<&'a Path>) -> ManifestPolicy<'a> {
+        ManifestPolicy {
+            mode: VerificationMode::Prod,
+            expected_language: Some("python"),
+            expected_release_channel: Some("prod"),
+            allowed_firecracker_version: Some("1.12.0"),
+            allowed_firecracker_binary_sha256: Some("fc-sha"),
+            require_hashes: true,
+            require_signatures: true,
+            keyring_path,
+        }
+    }
+
+    #[test]
+    fn test_unsigned_dev_template_rejected_in_prod() {
+        let tmp = TempDir::new().unwrap();
+        create_signed_manifest(tmp.path(), "dev", false).unwrap();
+        let result = verify_template_artifacts_with_policy(tmp.path(), &prod_policy(None));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("required channel") || err.contains("promotion_channel"),
+            "expected dev-channel rejection, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_signed_wrong_channel_template_rejected_in_prod() {
+        let tmp = TempDir::new().unwrap();
+        let keyring = create_signed_manifest(tmp.path(), "staging", true).unwrap();
+        let result =
+            verify_template_artifacts_with_policy(tmp.path(), &prod_policy(keyring.as_deref()));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("required channel") || err.contains("promotion_channel"),
+            "expected signed wrong-channel rejection, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_signed_prod_template_accepted_with_matching_keyring() {
+        let tmp = TempDir::new().unwrap();
+        let keyring = create_signed_manifest(tmp.path(), "prod", true).unwrap();
+        let result =
+            verify_template_artifacts_with_policy(tmp.path(), &prod_policy(keyring.as_deref()));
+        assert!(
+            result.is_ok(),
+            "expected signed prod template to pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_modified_signed_manifest_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let keyring = create_signed_manifest(tmp.path(), "prod", true).unwrap();
+        let manifest_path = tmp.path().join(TEMPLATE_MANIFEST_FILENAME);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["mem_size_mib"] = serde_json::json!(1024);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let result =
+            verify_template_artifacts_with_policy(tmp.path(), &prod_policy(keyring.as_deref()));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("signature verification failed") || err.contains("manifest_signed_fields"),
+            "expected signature verification failure, got: {}",
             err
         );
     }

@@ -11,7 +11,6 @@ User=zeroboot
 Group=kvm
 WorkingDirectory=/var/lib/zeroboot
 EnvironmentFile=-/etc/zeroboot/env
-EnvironmentFile=-/etc/zeroboot/zeroboot.env
 ExecStartPre=/var/lib/zeroboot/current/bin/zeroboot verify-startup "python:/var/lib/zeroboot/current/templates/python,node:/var/lib/zeroboot/current/templates/node" --release-root /var/lib/zeroboot/current
 ExecStart=/var/lib/zeroboot/current/bin/zeroboot serve "python:/var/lib/zeroboot/current/templates/python,node:/var/lib/zeroboot/current/templates/node" 8080
 Restart=on-failure
@@ -30,7 +29,7 @@ Environment=ZEROBOOT_REQUIRE_TEMPLATE_HASHES=true
 Environment=ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=true
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 ProtectSystem=strict
-ReadWritePaths=/var/lib/zeroboot /etc/zeroboot /var/log/zeroboot
+ReadWritePaths=/var/lib/zeroboot /etc/zeroboot
 PrivateTmp=true
 NoNewPrivileges=true
 TasksMax=1024

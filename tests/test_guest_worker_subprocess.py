@@ -1,8 +1,10 @@
 import json
+import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from typing import Optional
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,13 +28,21 @@ def parse_response(data: bytes):
 
 
 class GuestWorkerSubprocessTests(unittest.TestCase):
-    def run_child(self, code: str):
+    def run_child(
+        self,
+        code: str,
+        *,
+        stdin: str = "",
+        limits: Optional[dict] = None,
+        raw_input: Optional[bytes] = None,
+    ):
         payload = {
             "request_id": "t1",
             "timeout_ms": 2000,
             "code": code,
-            "stdin": "",
-            "limits": {
+            "stdin": stdin,
+            "limits": limits
+            or {
                 "stdout_bytes": 1024,
                 "stderr_bytes": 1024,
                 "tmp_bytes": 4096,
@@ -44,9 +54,10 @@ class GuestWorkerSubprocessTests(unittest.TestCase):
         }
         proc = subprocess.run(
             [sys.executable, str(CHILD)],
-            input=json.dumps(payload).encode("utf-8"),
+            input=raw_input if raw_input is not None else json.dumps(payload).encode("utf-8"),
             capture_output=True,
             timeout=5,
+            env={**os.environ, "ZEROBOOT_CHILD_LIMIT_PROFILE": "compat"},
         )
         self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
         return parse_response(proc.stdout)
@@ -78,6 +89,48 @@ class GuestWorkerSubprocessTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(error_type, "ok")
         self.assertEqual(stdout.strip(), b"True")
+
+    def test_temp_environment_aliases_match_request_scope(self):
+        code = (
+            "import os\n"
+            "tmp = os.environ['ZEROBOOT_TMPDIR']\n"
+            "print(all(os.environ[key] == tmp for key in ['TMPDIR', 'TMP', 'TEMP']))\n"
+            "print(os.environ['HOME'] == tmp)\n"
+            "print(os.environ['ZEROBOOT_OFFLINE'])\n"
+        )
+        _, exit_code, error_type, stdout, _stderr, _flags = self.run_child(code)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(error_type, "ok")
+        self.assertEqual(stdout.splitlines(), [b"True", b"True", b"1"])
+
+    def test_child_setup_failure_is_framed(self):
+        request_id, exit_code, error_type, _stdout, stderr, _flags = self.run_child(
+            "",
+            raw_input=b"{not-json",
+        )
+        self.assertEqual(request_id, b"error")
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(error_type, "internal")
+        self.assertIn(b"JSONDecodeError", stderr)
+
+    def test_child_stdout_truncation_sets_flag(self):
+        request_id, exit_code, error_type, stdout, _stderr, flags = self.run_child(
+            "print('x' * 2048)",
+            limits={
+                "stdout_bytes": 64,
+                "stderr_bytes": 1024,
+                "tmp_bytes": 4096,
+                "memory_bytes": 256 * 1024 * 1024,
+                "nofile": 32,
+                "nproc": 8,
+                "fsize_bytes": 4096,
+            },
+        )
+        self.assertEqual(request_id, b"t1")
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(error_type, "ok")
+        self.assertTrue(flags & 1)
+        self.assertIn(b"[truncated]", stdout)
 
 
 if __name__ == "__main__":

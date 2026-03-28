@@ -139,11 +139,17 @@ make guest-python
 make image-python
 make template-python
 
-# For Node guest images, install the pinned Node runtime into your rootfs template tree first
-bash scripts/install_node_runtime.sh /path/to/base-rootfs-tree /var/lib/zeroboot/artifacts
-make guest-node NODE_ROOTFS_TEMPLATE=/path/to/base-rootfs-tree
+# Materialize the pinned Ubuntu ext4 rootfs into a writable template tree
+bash scripts/prepare_rootfs_template.sh /var/lib/zeroboot/artifacts/rootfs/ubuntu-22.04.ext4 /tmp/zb-rootfs-template
+
+# For Node guest images, install the pinned Node runtime into a copy of that template tree first
+cp -a /tmp/zb-rootfs-template /tmp/zb-rootfs-template-node
+bash scripts/install_node_runtime.sh /tmp/zb-rootfs-template-node /var/lib/zeroboot/artifacts
+make guest-node NODE_ROOTFS_TEMPLATE=/tmp/zb-rootfs-template-node
 make image-node
 make template-node
+
+# build_rootfs_image.sh auto-sizes the ext4 images when size-mib is omitted
 
 # Run locally
 ./target/release/zeroboot serve python:/var/lib/zeroboot/current/templates/python 8080

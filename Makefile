@@ -11,7 +11,7 @@ PY_ROOTFS ?= $(ROOT)/guest/rootfs-python.ext4
 NODE_ROOTFS ?= $(ROOT)/guest/rootfs-node.ext4
 PY_ROOTFS_TEMPLATE ?=
 NODE_ROOTFS_TEMPLATE ?=
-ROOTFS_IMAGE_SIZE_MIB ?= 256
+ROOTFS_IMAGE_SIZE_MIB ?=
 
 .PHONY: build test guest-python guest-node image-python image-node template-python template-node verify clean
 
@@ -28,10 +28,10 @@ guest-node:
 	./scripts/build_guest_rootfs.sh node $(NODE_STAGING) $(if $(NODE_ROOTFS_TEMPLATE),--rootfs-template $(NODE_ROOTFS_TEMPLATE),) --write-manifest $(NODE_STAGING_MANIFEST)
 
 image-python: guest-python
-	./scripts/build_rootfs_image.sh $(PY_STAGING) $(PY_ROOTFS) $(ROOTFS_IMAGE_SIZE_MIB)
+	./scripts/build_rootfs_image.sh $(PY_STAGING) $(PY_ROOTFS) $(if $(ROOTFS_IMAGE_SIZE_MIB),$(ROOTFS_IMAGE_SIZE_MIB))
 
 image-node: guest-node
-	./scripts/build_rootfs_image.sh $(NODE_STAGING) $(NODE_ROOTFS) $(ROOTFS_IMAGE_SIZE_MIB)
+	./scripts/build_rootfs_image.sh $(NODE_STAGING) $(NODE_ROOTFS) $(if $(ROOTFS_IMAGE_SIZE_MIB),$(ROOTFS_IMAGE_SIZE_MIB))
 
 template-python: build
 	mkdir -p $(PY_WORKDIR)
