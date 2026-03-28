@@ -33,6 +33,11 @@ if [[ "${EUID}" -ne 0 ]]; then
   use_sudo=1
 fi
 
+# Safety guard: refuse to delete clearly unsafe output directories.
+if [[ -z "$OUTPUT_DIR" || "$OUTPUT_DIR" == "/" || "$OUTPUT_DIR" == "." ]]; then
+  echo "refusing to delete unsafe output directory: '$OUTPUT_DIR'" >&2
+  exit 1
+fi
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 
