@@ -24,7 +24,7 @@ jobs:
       - name: node syntax
         run: node --check guest/worker_node.js && node --check guest/worker_supervisor.js && node --check guest/worker_child.js
       - name: shell syntax
-        run: bash -n verify.sh deploy/deploy.sh scripts/build_guest_rootfs.sh scripts/build_rootfs_image.sh scripts/preflight.sh scripts/create_release_bundle.sh scripts/fetch_official_artifacts.sh scripts/install_node_runtime.sh
+        run: bash -n verify.sh deploy/deploy.sh scripts/build_guest_rootfs.sh scripts/build_rootfs_image.sh scripts/preflight.sh scripts/create_release_bundle.sh scripts/fetch_official_artifacts.sh scripts/install_node_runtime.sh scripts/prepare_rootfs_template.sh
       - name: unit tests
         run: python -m unittest discover -s tests -p 'test_*.py'
       - name: release bundle
@@ -78,11 +78,13 @@ jobs:
       - name: Assemble promoted release
         run: |
           set -euo pipefail
-          mkdir -p /tmp/zb-rootfs-template/usr/bin /tmp/zb-rootfs-template/tmp /tmp/zb-rootfs-template/zeroboot
-          bash scripts/install_node_runtime.sh /tmp/zb-rootfs-template /tmp/zb-artifacts
-          bash scripts/build_guest_rootfs.sh python /tmp/zb-staging-python --rootfs-template /tmp/zb-rootfs-template
+          bash scripts/prepare_rootfs_template.sh /tmp/zb-artifacts/rootfs/ubuntu-22.04.ext4 /tmp/zb-rootfs-template-base
+          cp -a /tmp/zb-rootfs-template-base /tmp/zb-rootfs-template-python
+          cp -a /tmp/zb-rootfs-template-base /tmp/zb-rootfs-template-node
+          bash scripts/install_node_runtime.sh /tmp/zb-rootfs-template-node /tmp/zb-artifacts
+          bash scripts/build_guest_rootfs.sh python /tmp/zb-staging-python --rootfs-template /tmp/zb-rootfs-template-python
           bash scripts/build_rootfs_image.sh /tmp/zb-staging-python /tmp/rootfs-python.ext4 256
-          bash scripts/build_guest_rootfs.sh node /tmp/zb-staging-node --rootfs-template /tmp/zb-rootfs-template
+          bash scripts/build_guest_rootfs.sh node /tmp/zb-staging-node --rootfs-template /tmp/zb-rootfs-template-node
           bash scripts/build_rootfs_image.sh /tmp/zb-staging-node /tmp/rootfs-node.ext4 256
           mkdir -p /tmp/zb-release/bin /tmp/zb-release/templates/python /tmp/zb-release/templates/node
           cp ./target/release/zeroboot /tmp/zb-release/bin/zeroboot
