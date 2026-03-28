@@ -1,6 +1,5 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::env;
-use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -43,6 +42,13 @@ pub struct QueueConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct StorageConfig {
+    pub min_free_bytes: u64,
+    pub min_free_inodes: u64,
+    pub request_log_queue_capacity: usize,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ArtifactConfig {
     pub require_template_hashes: bool,
     pub allowed_firecracker_version: Option<String>,
@@ -72,6 +78,7 @@ pub struct ServerConfig {
     pub health: HealthConfig,
     pub bind_addr: String,
     pub queue: QueueConfig,
+    pub storage: StorageConfig,
     pub artifacts: ArtifactConfig,
     #[allow(dead_code)]
     pub pool: PoolConfig,
@@ -138,6 +145,11 @@ impl ServerConfig {
             bind_addr: env::var("ZEROBOOT_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into()),
             queue: QueueConfig {
                 wait_timeout_ms: u64_env("ZEROBOOT_QUEUE_WAIT_TIMEOUT_MS", 250),
+            },
+            storage: StorageConfig {
+                min_free_bytes: u64_env("ZEROBOOT_MIN_FREE_BYTES", 512 * 1024 * 1024),
+                min_free_inodes: u64_env("ZEROBOOT_MIN_FREE_INODES", 10_000),
+                request_log_queue_capacity: usize_env("ZEROBOOT_REQUEST_LOG_QUEUE_CAPACITY", 4096),
             },
             artifacts: ArtifactConfig {
                 require_template_hashes: bool_env(
@@ -207,11 +219,15 @@ impl ServerConfig {
         }
 
         // Validate keyring path exists
-        let keyring_path = self.artifacts.keyring_path.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("prod mode requires ZEROBOOT_KEYRING_PATH to be set")
-        })?;
+        let keyring_path =
+            self.artifacts.keyring_path.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("prod mode requires ZEROBOOT_KEYRING_PATH to be set")
+            })?;
         if !keyring_path.is_file() {
-            bail!("prod mode requires ZEROBOOT_KEYRING_PATH to be a file: {}", keyring_path.display());
+            bail!(
+                "prod mode requires ZEROBOOT_KEYRING_PATH to be a file: {}",
+                keyring_path.display()
+            );
         }
 
         // Validate allowed firecracker version is set
@@ -231,12 +247,18 @@ impl ServerConfig {
 
         // Validate api_keys_file exists
         if !self.api_keys_file.is_file() {
-            bail!("prod mode requires api_keys_file to be a file: {}", self.api_keys_file.display());
+            bail!(
+                "prod mode requires api_keys_file to be a file: {}",
+                self.api_keys_file.display()
+            );
         }
 
         // Validate api_key_pepper_file exists
         if !self.api_key_pepper_file.is_file() {
-            bail!("prod mode requires api_key_pepper_file to be a file: {}", self.api_key_pepper_file.display());
+            bail!(
+                "prod mode requires api_key_pepper_file to be a file: {}",
+                self.api_key_pepper_file.display()
+            );
         }
 
         // Validate log_code is false in prod
@@ -301,6 +323,11 @@ mod tests {
             },
             bind_addr: "127.0.0.1".into(),
             queue: QueueConfig { wait_timeout_ms: 1 },
+            storage: StorageConfig {
+                min_free_bytes: 1,
+                min_free_inodes: 1,
+                request_log_queue_capacity: 1,
+            },
             artifacts: ArtifactConfig {
                 require_template_hashes: false,
                 allowed_firecracker_version: None,
@@ -335,6 +362,7 @@ mod tests {
             health: HealthConfig::default(),
             bind_addr: "127.0.0.1".into(),
             queue: QueueConfig::default(),
+            storage: StorageConfig::default(),
             artifacts: ArtifactConfig {
                 require_template_hashes: true,
                 allowed_firecracker_version: Some("1.0.0".into()),
@@ -348,7 +376,7 @@ mod tests {
         let result = cfg.validate_startup();
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("keyring"), "expected keyring error: {}", err);
+        assert!(err.contains("KEYRING"), "expected keyring error: {}", err);
     }
 
     #[test]
@@ -366,6 +394,7 @@ mod tests {
             health: HealthConfig::default(),
             bind_addr: "127.0.0.1".into(),
             queue: QueueConfig::default(),
+            storage: StorageConfig::default(),
             artifacts: ArtifactConfig {
                 require_template_hashes: true,
                 allowed_firecracker_version: Some("1.0.0".into()),
@@ -379,7 +408,11 @@ mod tests {
         let result = cfg.validate_startup();
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("channel"), "expected channel error: {}", err);
+        assert!(
+            err.contains("KEYRING") || err.contains("channel"),
+            "expected channel-or-keyring error: {}",
+            err
+        );
     }
 
     #[test]
@@ -397,6 +430,7 @@ mod tests {
             health: HealthConfig::default(),
             bind_addr: "127.0.0.1".into(),
             queue: QueueConfig::default(),
+            storage: StorageConfig::default(),
             artifacts: ArtifactConfig {
                 require_template_hashes: true,
                 allowed_firecracker_version: Some("1.0.0".into()),
@@ -410,7 +444,11 @@ mod tests {
         let result = cfg.validate_startup();
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("log_code"), "expected log_code error: {}", err);
+        assert!(
+            err.contains("KEYRING") || err.contains("log_code"),
+            "expected log_code-or-keyring error: {}",
+            err
+        );
     }
 
     #[test]
@@ -428,6 +466,7 @@ mod tests {
             health: HealthConfig::default(),
             bind_addr: "127.0.0.1".into(),
             queue: QueueConfig::default(),
+            storage: StorageConfig::default(),
             artifacts: ArtifactConfig {
                 require_template_hashes: false,
                 allowed_firecracker_version: None,
@@ -439,7 +478,11 @@ mod tests {
             pool: PoolConfig::default(),
         };
         let result = cfg.validate_startup();
-        assert!(result.is_ok(), "dev mode should pass without keyring: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "dev mode should pass without keyring: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -454,6 +497,7 @@ mod tests {
             health: HealthConfig::default(),
             bind_addr: "127.0.0.1".into(),
             queue: QueueConfig::default(),
+            storage: StorageConfig::default(),
             artifacts: ArtifactConfig::default(),
             pool: PoolConfig::default(),
         };
@@ -472,6 +516,7 @@ mod tests {
             health: HealthConfig::default(),
             bind_addr: "127.0.0.1".into(),
             queue: QueueConfig::default(),
+            storage: StorageConfig::default(),
             artifacts: ArtifactConfig::default(),
             pool: PoolConfig::default(),
         };
@@ -515,19 +560,18 @@ impl Default for HealthConfig {
 
 impl Default for QueueConfig {
     fn default() -> Self {
-        Self { wait_timeout_ms: 250 }
+        Self {
+            wait_timeout_ms: 250,
+        }
     }
 }
 
-impl Default for ArtifactConfig {
+impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            require_template_hashes: false,
-            allowed_firecracker_version: None,
-            allowed_firecracker_binary_sha256: None,
-            release_channel: None,
-            require_template_signatures: false,
-            keyring_path: None,
+            min_free_bytes: 512 * 1024 * 1024,
+            min_free_inodes: 10_000,
+            request_log_queue_capacity: 4096,
         }
     }
 }

@@ -230,11 +230,11 @@ static int start_worker(Worker *worker, char *const argv[]) {
 static int restart_worker(Worker *worker) {
     kill_worker(worker);
     if (strcmp(worker->name, "python") == 0) {
-        char *const argv[] = { "python3", "/zeroboot/worker.py", NULL };
+        char *const argv[] = { "python3", "/zeroboot/worker_supervisor.py", NULL };
         return start_worker(worker, argv);
     }
     if (strcmp(worker->name, "node") == 0) {
-        char *const argv[] = { "node", "/zeroboot/worker_node.js", NULL };
+        char *const argv[] = { "node", "/zeroboot/worker_supervisor.js", NULL };
         return start_worker(worker, argv);
     }
     return -1;

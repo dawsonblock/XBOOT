@@ -33,15 +33,16 @@ pub struct ManifestPolicy<'a> {
 }
 
 impl<'a> ManifestPolicy<'a> {
-    pub fn from_config(
-        config: &'a crate::config::ServerConfig,
-    ) -> Self {
+    pub fn from_config(config: &'a crate::config::ServerConfig) -> Self {
         Self {
             mode: config.verification_mode(),
             expected_language: None,
             expected_release_channel: config.expected_release_channel(),
             allowed_firecracker_version: config.artifacts.allowed_firecracker_version.as_deref(),
-            allowed_firecracker_binary_sha256: config.artifacts.allowed_firecracker_binary_sha256.as_deref(),
+            allowed_firecracker_binary_sha256: config
+                .artifacts
+                .allowed_firecracker_binary_sha256
+                .as_deref(),
             require_hashes: config.artifacts.require_template_hashes,
             require_signatures: config.artifacts.require_template_signatures,
             keyring_path: config.artifacts.keyring_path.as_deref(),
@@ -235,6 +236,7 @@ pub fn resolve_path_confined(workdir: &Path, raw: &str) -> Result<PathBuf> {
 /// - Path confinement (no escaping paths)
 /// - Protocol version matching
 /// - Firecracker version matching
+#[allow(clippy::too_many_arguments)]
 pub fn verify_template_artifacts(
     workdir: &Path,
     expected_language: Option<&str>,
@@ -259,7 +261,6 @@ pub fn verify_template_artifacts(
     verify_template_artifacts_with_policy(workdir, &policy)
 }
 
-
 /// Verify template artifacts using a ManifestPolicy.
 /// This is the preferred API - it centralizes all verification parameters.
 pub fn verify_template_artifacts_with_policy(
@@ -275,7 +276,10 @@ pub fn verify_template_artifacts_with_policy(
         match manifest.schema_version {
             Some(1) => {} // Version 1 is supported
             Some(unsupported) => {
-                bail!("unsupported schema_version in prod mode: {}, only version 1 is supported", unsupported);
+                bail!(
+                    "unsupported schema_version in prod mode: {}, only version 1 is supported",
+                    unsupported
+                );
             }
             None => {
                 bail!("template manifest missing schema_version in prod mode");
@@ -288,7 +292,8 @@ pub fn verify_template_artifacts_with_policy(
             Some(actual) if actual == expected_channel => {}
             Some(actual) => bail!(
                 "template not promoted to required channel: got '{}', expected '{}'",
-                actual, expected_channel
+                actual,
+                expected_channel
             ),
             None => bail!("template manifest missing promotion_channel in prod mode"),
         }
@@ -497,11 +502,20 @@ mod tests {
         schema_version: Option<u32>,
     ) -> Result<PathBuf> {
         let mut manifest = serde_json::json!({
+            "template_id": "tpl-test",
+            "build_id": "build-test",
+            "artifact_set_id": "artifact-test",
             "promotion_channel": promotion_channel,
+            "language": "python",
             "kernel_path": "vmlinux",
             "rootfs_path": "rootfs.ext4",
+            "init_path": "/init",
+            "mem_size_mib": 512,
             "snapshot_mem_path": "snapshot.mem",
             "snapshot_state_path": "snapshot.vmstate",
+            "snapshot_mem_bytes": 0,
+            "snapshot_state_bytes": 0,
+            "protocol_version": "ZB1",
         });
         if let Some(v) = schema_version {
             manifest["schema_version"] = serde_json::json!(v);
@@ -529,7 +543,11 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("schema_version"), "expected schema_version error: {}", err);
+        assert!(
+            err.contains("schema_version"),
+            "expected schema_version error: {}",
+            err
+        );
     }
 
     #[test]
@@ -550,7 +568,11 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("promotion_channel"), "expected promotion_channel error: {}", err);
+        assert!(
+            err.contains("promotion_channel") || err.contains("required channel"),
+            "expected promotion_channel error: {}",
+            err
+        );
     }
 
     #[test]
@@ -574,7 +596,11 @@ mod tests {
         // We're just checking schema isn't required
         assert!(result.is_err()); // Missing files, but NOT schema error
         let err = result.unwrap_err().to_string();
-        assert!(!err.contains("schema_version"), "dev mode should not require schema: {}", err);
+        assert!(
+            !err.contains("schema_version"),
+            "dev mode should not require schema: {}",
+            err
+        );
     }
 
     #[test]
@@ -600,94 +626,129 @@ mod tests {
         );
 
         // Should succeed with valid manifest and present files
-        assert!(result.is_ok(), "valid prod manifest should pass: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "valid prod manifest should pass: {:?}",
+            result
+        );
     }
 }
 
 #[cfg(test)]
 mod strict_enforcement_tests {
     use super::*;
-    use std::io::Write;
     use tempfile::TempDir;
 
     #[test]
     fn test_prod_rejects_missing_template_id() {
         let tmp = TempDir::new().unwrap();
         let workdir = tmp.path();
-        
+
         // Create manifest with missing template_id
         let mut manifest = TemplateManifest::default();
         manifest.schema_version = Some(1);
         manifest.promotion_channel = Some("prod".to_string());
         manifest.template_id = None; // Missing in prod
-        
+
         let path = workdir.join("template.manifest.json");
         let f = std::fs::File::create(&path).unwrap();
         serde_json::to_writer(f, &manifest).unwrap();
-        
+
         // Also need snapshot files for verification to proceed
         std::fs::write(workdir.join("snapshot.state"), "test").unwrap();
         std::fs::write(workdir.join("snapshot.mem"), "test").unwrap();
-        
+
         let policy = ManifestPolicy::prod_unchecked();
         let result = verify_template_artifacts_with_policy(workdir, &policy);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("template_id"), "expected template_id error: {}", err);
+        assert!(
+            err.contains("template_id"),
+            "expected template_id error: {}",
+            err
+        );
     }
 
     #[test]
     fn test_prod_rejects_path_escape() {
         let tmp = TempDir::new().unwrap();
         let workdir = tmp.path();
-        
+
         // Create manifest with path escape attempt
         let mut manifest = TemplateManifest::default();
         manifest.schema_version = Some(1);
         manifest.promotion_channel = Some("prod".to_string());
         manifest.template_id = Some("test".to_string());
+        manifest.build_id = Some("build".to_string());
+        manifest.artifact_set_id = Some("artifact".to_string());
+        manifest.language = Some("python".to_string());
+        manifest.kernel_path = "kernel".to_string();
+        manifest.rootfs_path = "rootfs".to_string();
+        manifest.init_path = "/init".to_string();
+        manifest.protocol_version = Some("ZB1".to_string());
         manifest.snapshot_state_path = "../../../etc/passwd".to_string();
         manifest.snapshot_mem_path = "mem".to_string();
         manifest.snapshot_state_bytes = 4;
         manifest.snapshot_mem_bytes = 4;
-        
+
         let path = workdir.join("template.manifest.json");
         let f = std::fs::File::create(&path).unwrap();
         serde_json::to_writer(f, &manifest).unwrap();
-        
+
         // Create dummy files
+        std::fs::write(workdir.join("kernel"), "test").unwrap();
+        std::fs::write(workdir.join("rootfs"), "test").unwrap();
         std::fs::write(workdir.join("mem"), "test").unwrap();
-        
+
         let policy = ManifestPolicy::prod_unchecked();
         let result = verify_template_artifacts_with_policy(workdir, &policy);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("confined") || err.contains("outside"), "expected path escape error: {}", err);
+        assert!(
+            err.contains("confined")
+                || err.contains("outside")
+                || err.contains("canonicalize template path"),
+            "expected path escape error: {}",
+            err
+        );
     }
 
     #[test]
     fn test_prod_rejects_unsupported_schema_version() {
         let tmp = TempDir::new().unwrap();
         let workdir = tmp.path();
-        
+
         // Create manifest with unsupported schema version
         let mut manifest = TemplateManifest::default();
         manifest.schema_version = Some(99); // Unsupported
         manifest.promotion_channel = Some("prod".to_string());
         manifest.template_id = Some("test".to_string());
-        
+        manifest.build_id = Some("build".to_string());
+        manifest.artifact_set_id = Some("artifact".to_string());
+        manifest.language = Some("python".to_string());
+        manifest.kernel_path = "kernel".to_string();
+        manifest.rootfs_path = "rootfs".to_string();
+        manifest.init_path = "/init".to_string();
+        manifest.protocol_version = Some("ZB1".to_string());
+
         let path = workdir.join("template.manifest.json");
         let f = std::fs::File::create(&path).unwrap();
         serde_json::to_writer(f, &manifest).unwrap();
-        
+
         // Also need snapshot files
+        std::fs::write(workdir.join("kernel"), "test").unwrap();
+        std::fs::write(workdir.join("rootfs"), "test").unwrap();
         std::fs::write(workdir.join("snapshot.state"), "test").unwrap();
         std::fs::write(workdir.join("snapshot.mem"), "test").unwrap();
-        
+
         let policy = ManifestPolicy::prod_unchecked();
         let result = verify_template_artifacts_with_policy(workdir, &policy);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("schema_version"), "expected schema_version error: {}", err);
+        assert!(
+            err.contains("schema_version"),
+            "expected schema_version error: {}",
+            err
+        );
     }
 }

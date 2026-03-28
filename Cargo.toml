@@ -9,15 +9,11 @@ keywords = ["vm", "sandbox", "kvm", "isolation", "firecracker"]
 categories = ["virtualization"]
 
 [dependencies]
-kvm-ioctls = "0.24"
-kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
-vmm-sys-util = "0.15"
 libc = "0.2"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-nix = { version = "0.31", features = ["fs", "mman", "ioctl"] }
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.11"
@@ -26,6 +22,12 @@ ring = "0.17"
 base64 = "0.22"
 hex = "0.4"
 tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls = "0.24"
+kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
+vmm-sys-util = "0.15"
+nix = { version = "0.31", features = ["fs", "mman", "ioctl"] }
 
 [profile.release]
 opt-level = 3

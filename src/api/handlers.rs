@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::auth;
+use crate::startup;
 
 fn process_memory_usage_bytes() -> u64 {
     #[cfg(target_os = "linux")]
@@ -32,7 +33,7 @@ fn process_memory_usage_bytes() -> u64 {
     }
     0
 }
-use tokio::sync::{mpsc::UnboundedSender, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc::Sender, OwnedSemaphorePermit, Semaphore};
 
 use crate::config::ServerConfig;
 use crate::protocol::{encode_request_frame, GuestRequest, GuestResponse};
@@ -89,9 +90,10 @@ pub struct HealthResponse {
 }
 
 /// Template health status categories for detailed diagnostics
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
 pub enum TemplateHealth {
     /// Template is healthy and ready to serve requests
+    #[default]
     Healthy,
     /// Template failed startup verification (missing fields, invalid signatures, etc.)
     QuarantinedTrust,
@@ -101,12 +103,7 @@ pub enum TemplateHealth {
     UnsupportedVersion,
 }
 
-impl Default for TemplateHealth {
-    fn default() -> Self {
-        TemplateHealth::Healthy
-    }
-}
-
+#[derive(Serialize, Clone)]
 pub struct TemplateStatus {
     pub ready: bool,
     pub detail: String,
@@ -177,8 +174,9 @@ pub struct AppState {
     pub metrics: Metrics,
     pub config: ServerConfig,
     pub execution_semaphore: Arc<Semaphore>,
-    pub request_log_tx: UnboundedSender<String>,
+    pub request_log_tx: Sender<String>,
     pub health_cache: Mutex<Option<CachedHealthState>>,
+    pub admission_paths: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -286,6 +284,9 @@ pub struct Metrics {
     pub worker_boot_failures: AtomicU64,
     pub worker_protocol_failures: AtomicU64,
     pub guest_unhealthy_templates: AtomicU64,
+    pub disk_pressure_rejections: AtomicU64,
+    pub request_log_write_failures: AtomicU64,
+    pub request_log_drops: AtomicU64,
     pub language_counters: Mutex<HashMap<String, LanguageMetrics>>,
 }
 
@@ -316,6 +317,9 @@ impl Metrics {
             worker_boot_failures: AtomicU64::new(0),
             worker_protocol_failures: AtomicU64::new(0),
             guest_unhealthy_templates: AtomicU64::new(0),
+            disk_pressure_rejections: AtomicU64::new(0),
+            request_log_write_failures: AtomicU64::new(0),
+            request_log_drops: AtomicU64::new(0),
             language_counters: Mutex::new(HashMap::new()),
         }
     }
@@ -503,7 +507,12 @@ fn log_request(
         "exec_time_ms": response.exec_time_ms,
         "total_time_ms": response.total_time_ms,
     });
-    let _ = state.request_log_tx.send(line.to_string());
+    if state.request_log_tx.try_send(line.to_string()).is_err() {
+        state
+            .metrics
+            .request_log_drops
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn round2(v: f64) -> f64 {
@@ -866,6 +875,9 @@ pub async fn exec_handler(
     headers: HeaderMap,
     Json(req): Json<ExecRequest>,
 ) -> impl IntoResponse {
+    if let Err(e) = check_runtime_admission(&state) {
+        return e.into_response();
+    }
     let api_key = match check_auth(&state, &headers) {
         Ok(k) => k,
         Err(e) => return e.into_response(),
@@ -908,6 +920,9 @@ pub async fn batch_handler(
     headers: HeaderMap,
     Json(req): Json<BatchRequest>,
 ) -> impl IntoResponse {
+    if let Err(e) = check_runtime_admission(&state) {
+        return e.into_response();
+    }
     let api_key = match check_auth(&state, &headers) {
         Ok(k) => k,
         Err(e) => return e.into_response(),
@@ -1004,9 +1019,55 @@ fn mask_api_key(api_key: &str) -> String {
     }
 }
 
+fn classify_template_health(ready: bool, detail: &str) -> TemplateHealth {
+    if ready {
+        return TemplateHealth::Healthy;
+    }
+
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("signature")
+        || detail.contains("verify")
+        || detail.contains("sha256")
+        || detail.contains("hash")
+    {
+        TemplateHealth::QuarantinedTrust
+    } else if detail.contains("version") || detail.contains("firecracker") {
+        TemplateHealth::UnsupportedVersion
+    } else {
+        TemplateHealth::QuarantinedHealth
+    }
+}
+
+fn check_runtime_admission(state: &AppState) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if let Err(error) = startup::ensure_runtime_admission(&state.config, &state.admission_paths) {
+        state
+            .metrics
+            .disk_pressure_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("runtime admission refused: {}", error),
+                request_id: None,
+            }),
+        ));
+    }
+    Ok(())
+}
+
 fn static_ready_state(state: &AppState) -> HealthResponse {
-    let templates = state.template_statuses.clone();
-    let all_ready = templates.values().all(|status| status.ready);
+    let mut templates = state.template_statuses.clone();
+    for status in templates.values_mut() {
+        status.health = classify_template_health(status.ready, &status.detail);
+    }
+    let mut all_ready = templates.values().all(|status| status.ready);
+    let mut error = None;
+    if let Err(admission_error) =
+        startup::ensure_runtime_admission(&state.config, &state.admission_paths)
+    {
+        all_ready = false;
+        error = Some(admission_error.to_string());
+    }
     HealthResponse {
         status: if all_ready {
             "ok".into()
@@ -1014,7 +1075,7 @@ fn static_ready_state(state: &AppState) -> HealthResponse {
             "degraded".into()
         },
         templates,
-        error: None,
+        error,
     }
 }
 
@@ -1036,19 +1097,7 @@ fn probe_all_templates(state: &AppState) -> HealthResponse {
                 .fetch_add(1, Ordering::Relaxed);
             all_ready = false;
         }
-        let health = if ready {
-            TemplateHealth::Healthy
-        } else {
-            // Check if it was a trust-related failure during startup
-            let detail = startup_status.detail.to_lowercase();
-            if detail.contains("verify") || detail.contains("signature") || detail.contains("hash") {
-                TemplateHealth::QuarantinedTrust
-            } else if detail.contains("version") || detail.contains("firecracker") {
-                TemplateHealth::UnsupportedVersion
-            } else {
-                TemplateHealth::QuarantinedHealth
-            }
-        };
+        let health = classify_template_health(ready, &startup_status.detail);
         templates.insert(
             name.clone(),
             TemplateStatus {
@@ -1128,127 +1177,183 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
     let total_slots = state.config.limits.max_concurrent_requests as u64;
     let used_slots = total_slots.saturating_sub(available_slots);
 
-    let mut out = format!(
-        "# HELP zeroboot_total_executions Total number of user executions
-\
-         # TYPE zeroboot_total_executions counter
-\
-         zeroboot_total_executions {}
-\
-         # HELP zeroboot_total_errors Total number of execution errors
-\
-         # TYPE zeroboot_total_errors counter
-\
-         zeroboot_total_errors {}
-\
-         # HELP zeroboot_total_timeouts Total number of execution timeouts
-\
-         # TYPE zeroboot_total_timeouts counter
-\
-         zeroboot_total_timeouts {}
-\
-         # HELP zeroboot_protocol_errors Total number of protocol failures
-\
-         # TYPE zeroboot_protocol_errors counter
-\
-         zeroboot_protocol_errors {}
-\
-         # HELP zeroboot_output_truncations Total number of truncated responses
-\
-         # TYPE zeroboot_output_truncations counter
-\
-         zeroboot_output_truncations {}
-\
-         # HELP zeroboot_worker_recycles Total number of guest worker recycle requests observed
-\
-         # TYPE zeroboot_worker_recycles counter
-\
-         zeroboot_worker_recycles {}
-\
-         # HELP zeroboot_queue_rejections Total number of queue rejections
-\
-         # TYPE zeroboot_queue_rejections counter
-\
-         zeroboot_queue_rejections {}
-\
-         # HELP zeroboot_health_failures Total number of failed health probes
-\
-         # TYPE zeroboot_health_failures counter
-\
-         zeroboot_health_failures {}
-\
-         # HELP zeroboot_template_quarantines Total number of templates quarantined at startup
-\
-         # TYPE zeroboot_template_quarantines gauge
-\
-         zeroboot_template_quarantines {}
-\
-         # HELP zeroboot_concurrent_forks Current number of in-flight executions
-\
-         # TYPE zeroboot_concurrent_forks gauge
-\
-         zeroboot_concurrent_forks {}
-\
-         # HELP zeroboot_execution_slots_available Available execution slots in the admission semaphore
-\
-         # TYPE zeroboot_execution_slots_available gauge
-\
-         zeroboot_execution_slots_available {}
-\
-         # HELP zeroboot_execution_slots_used Execution slots currently consumed by in-flight or queued work
-\
-         # TYPE zeroboot_execution_slots_used gauge
-\
-         zeroboot_execution_slots_used {}
-\
-         # HELP zeroboot_execution_slots_capacity Total execution slot capacity
-\
-         # TYPE zeroboot_execution_slots_capacity gauge
-\
-         zeroboot_execution_slots_capacity {}
-\
-         # HELP zeroboot_memory_usage_bytes Resident memory usage for the zeroboot process
-\
-         # TYPE zeroboot_memory_usage_bytes gauge
-\
-         zeroboot_memory_usage_bytes {}
-\
-         # HELP zeroboot_fork_time_sum_milliseconds Sum of fork times in milliseconds
-\
-         # TYPE zeroboot_fork_time_sum_milliseconds counter
-\
-         zeroboot_fork_time_sum_milliseconds {}
-\
-         # HELP zeroboot_exec_time_sum_milliseconds Sum of exec times in milliseconds
-\
-         # TYPE zeroboot_exec_time_sum_milliseconds counter
-\
-         zeroboot_exec_time_sum_milliseconds {}
-",
-        total,
-        errors,
-        timeouts,
-        m.protocol_errors.load(Ordering::Relaxed),
-        m.output_truncations.load(Ordering::Relaxed),
-        m.worker_recycles.load(Ordering::Relaxed),
-        m.queue_rejections.load(Ordering::Relaxed),
-        m.health_failures.load(Ordering::Relaxed),
-        m.template_quarantines.load(Ordering::Relaxed),
-        // Additional trust chain and restore metrics (Commit 14)
-        m.manifest_verification_failures.load(Ordering::Relaxed),
-        m.signature_verification_failures.load(Ordering::Relaxed),
-        m.template_version_mismatches.load(Ordering::Relaxed),
-        m.restore_failures.load(Ordering::Relaxed),
-        m.worker_boot_failures.load(Ordering::Relaxed),
-        m.worker_protocol_failures.load(Ordering::Relaxed),
-        m.guest_unhealthy_templates.load(Ordering::Relaxed),
-        concurrent,
-        available_slots,
-        used_slots,
-        total_slots,
-        process_rss,
-        fork_sum as f64 / 1000.0,
-        exec_sum as f64 / 1000.0,
+    let mut out = String::new();
+    let mut push_metric = |name: &str, help: &str, metric_type: &str, value: String| {
+        out.push_str(&format!(
+            "# HELP {} {}\n# TYPE {} {}\n{} {}\n",
+            name, help, name, metric_type, name, value
+        ));
+    };
+
+    push_metric(
+        "zeroboot_total_executions",
+        "Total number of user executions",
+        "counter",
+        total.to_string(),
+    );
+    push_metric(
+        "zeroboot_total_errors",
+        "Total number of execution errors",
+        "counter",
+        errors.to_string(),
+    );
+    push_metric(
+        "zeroboot_total_timeouts",
+        "Total number of execution timeouts",
+        "counter",
+        timeouts.to_string(),
+    );
+    push_metric(
+        "zeroboot_protocol_errors",
+        "Total number of protocol failures",
+        "counter",
+        m.protocol_errors.load(Ordering::Relaxed).to_string(),
+    );
+    push_metric(
+        "zeroboot_output_truncations",
+        "Total number of truncated responses",
+        "counter",
+        m.output_truncations.load(Ordering::Relaxed).to_string(),
+    );
+    push_metric(
+        "zeroboot_worker_recycles",
+        "Total number of guest worker recycle requests observed",
+        "counter",
+        m.worker_recycles.load(Ordering::Relaxed).to_string(),
+    );
+    push_metric(
+        "zeroboot_queue_rejections",
+        "Total number of queue rejections",
+        "counter",
+        m.queue_rejections.load(Ordering::Relaxed).to_string(),
+    );
+    push_metric(
+        "zeroboot_health_failures",
+        "Total number of failed health probes",
+        "counter",
+        m.health_failures.load(Ordering::Relaxed).to_string(),
+    );
+    push_metric(
+        "zeroboot_template_quarantines",
+        "Total number of templates quarantined at startup",
+        "gauge",
+        m.template_quarantines.load(Ordering::Relaxed).to_string(),
+    );
+    push_metric(
+        "zeroboot_manifest_verification_failures",
+        "Total number of template manifest verification failures",
+        "counter",
+        m.manifest_verification_failures
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    push_metric(
+        "zeroboot_signature_verification_failures",
+        "Total number of template signature verification failures",
+        "counter",
+        m.signature_verification_failures
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    push_metric(
+        "zeroboot_template_version_mismatches",
+        "Total number of template version mismatches",
+        "counter",
+        m.template_version_mismatches
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    push_metric(
+        "zeroboot_restore_failures",
+        "Total number of VM restore failures",
+        "counter",
+        m.restore_failures.load(Ordering::Relaxed).to_string(),
+    );
+    push_metric(
+        "zeroboot_worker_boot_failures",
+        "Total number of guest worker boot failures",
+        "counter",
+        m.worker_boot_failures.load(Ordering::Relaxed).to_string(),
+    );
+    push_metric(
+        "zeroboot_worker_protocol_failures",
+        "Total number of guest worker protocol failures",
+        "counter",
+        m.worker_protocol_failures
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    push_metric(
+        "zeroboot_guest_unhealthy_templates",
+        "Total number of guest templates that failed health probing",
+        "counter",
+        m.guest_unhealthy_templates
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    push_metric(
+        "zeroboot_disk_pressure_rejections",
+        "Total number of requests refused due to disk or inode watermarks",
+        "counter",
+        m.disk_pressure_rejections
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    push_metric(
+        "zeroboot_request_log_write_failures",
+        "Total number of request log write failures",
+        "counter",
+        m.request_log_write_failures
+            .load(Ordering::Relaxed)
+            .to_string(),
+    );
+    push_metric(
+        "zeroboot_request_log_drops",
+        "Total number of request log records dropped due to a full queue",
+        "counter",
+        m.request_log_drops.load(Ordering::Relaxed).to_string(),
+    );
+    push_metric(
+        "zeroboot_concurrent_forks",
+        "Current number of in-flight executions",
+        "gauge",
+        concurrent.to_string(),
+    );
+    push_metric(
+        "zeroboot_execution_slots_available",
+        "Available execution slots in the admission semaphore",
+        "gauge",
+        available_slots.to_string(),
+    );
+    push_metric(
+        "zeroboot_execution_slots_used",
+        "Execution slots currently consumed by in-flight or queued work",
+        "gauge",
+        used_slots.to_string(),
+    );
+    push_metric(
+        "zeroboot_execution_slots_capacity",
+        "Total execution slot capacity",
+        "gauge",
+        total_slots.to_string(),
+    );
+    push_metric(
+        "zeroboot_memory_usage_bytes",
+        "Resident memory usage for the zeroboot process",
+        "gauge",
+        process_rss.to_string(),
+    );
+    push_metric(
+        "zeroboot_fork_time_sum_milliseconds",
+        "Sum of fork times in milliseconds",
+        "counter",
+        format!("{}", fork_sum as f64 / 1000.0),
+    );
+    push_metric(
+        "zeroboot_exec_time_sum_milliseconds",
+        "Sum of exec times in milliseconds",
+        "counter",
+        format!("{}", exec_sum as f64 / 1000.0),
     );
     out.push_str(&m.fork_time_hist.render(
         "zeroboot_fork_time_milliseconds",

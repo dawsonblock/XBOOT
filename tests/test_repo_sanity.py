@@ -3,30 +3,28 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST_PLACEHOLDER_ALLOWLIST = {
-    'kernel.manifest': {'firecracker_version', 'kernel_version', 'kernel_sha256'},
-    'python-guest.manifest': {'base_rootfs', 'base_rootfs_sha256', 'runtime_version'},
-    'node-guest.manifest': {'base_rootfs', 'base_rootfs_sha256', 'runtime_version'},
-}
 LOCK_FILES = [
     'manifests/python-build.lock.json',
     'manifests/node-build.lock.json',
     'manifests/firecracker.lock.json',
+    'manifests/runtime-artifacts.lock.json',
 ]
 
 
 class RepoSanityTests(unittest.TestCase):
-    def test_manifests_do_not_use_unknown_required_placeholders(self):
+    def test_manifests_do_not_leave_required_placeholders(self):
         manifest_dir = ROOT / 'manifests'
         for path in manifest_dir.glob('*.manifest'):
-            allowed = MANIFEST_PLACEHOLDER_ALLOWLIST.get(path.name, set())
             for raw_line in path.read_text().splitlines():
                 line = raw_line.strip()
                 if not line or line.startswith('#') or '=REQUIRED' not in line:
                     continue
-                key, value = line.split('=', 1)
-                self.assertEqual(value, 'REQUIRED', f"{path.name}: unresolved placeholder must be exactly REQUIRED")
-                self.assertIn(key, allowed, f"{path.name}: unexpected REQUIRED placeholder for {key}")
+                self.fail(f"{path.name}: unresolved REQUIRED placeholder remains: {line}")
+
+    def test_lock_files_do_not_leave_required_placeholders(self):
+        for rel in LOCK_FILES:
+            path = ROOT / rel
+            self.assertNotIn('REQUIRED', path.read_text(), rel)
 
     def test_repo_contains_no_pin_me_tokens(self):
         sentinel = 'PIN_' + 'ME'

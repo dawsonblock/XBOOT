@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use kvm_bindings::*;
 
 // Known vmstate format version - must match Firecracker version
@@ -33,7 +33,7 @@ pub fn pre_restore_validate(
         }
     } else {
         return Err(VmstateValidationError::UnsupportedVersion(
-            "cannot verify vmstate compatibility: Firecracker version unknown".to_string()
+            "cannot verify vmstate compatibility: Firecracker version unknown".to_string(),
         ));
     }
 
@@ -48,7 +48,7 @@ pub fn pre_restore_validate(
     // 3. Verify we can detect the offset shift (IOAPIC base address must be present)
     if detect_offset_shift(data).is_err() {
         return Err(VmstateValidationError::CorruptData(
-            "cannot detect vmstate layout: IOAPIC base address 0xFEC00000 not found".to_string()
+            "cannot detect vmstate layout: IOAPIC base address 0xFEC00000 not found".to_string(),
         ));
     }
 
@@ -56,7 +56,7 @@ pub fn pre_restore_validate(
     let cpuid_entries = parse_cpuid(data);
     if cpuid_entries.is_empty() {
         return Err(VmstateValidationError::InvalidCpuid(
-            "no valid CPUID entries found in vmstate".to_string()
+            "no valid CPUID entries found in vmstate".to_string(),
         ));
     }
 
@@ -64,7 +64,7 @@ pub fn pre_restore_validate(
     let msrs = parse_msrs(data);
     if msrs.is_empty() {
         return Err(VmstateValidationError::InvalidMsrSet(
-            "no valid MSR entries found in vmstate".to_string()
+            "no valid MSR entries found in vmstate".to_string(),
         ));
     }
 
@@ -73,7 +73,7 @@ pub fn pre_restore_validate(
     let rip = r64(data, adj(REF_REGS, shift) + 128);
     if rip == 0 {
         return Err(VmstateValidationError::CorruptData(
-            "vmstate has zero RIP - invalid CPU state".to_string()
+            "vmstate has zero RIP - invalid CPU state".to_string(),
         ));
     }
 

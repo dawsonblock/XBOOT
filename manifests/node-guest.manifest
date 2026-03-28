@@ -1,9 +1,9 @@
 # Runtime manifest for the Node guest image.
 language=node
-base_rootfs=REQUIRED
-base_rootfs_sha256=REQUIRED
+base_rootfs=http://spec.ccfc.min.s3.amazonaws.com/firecracker-ci/v1.10/x86_64/ubuntu-22.04.ext4
+base_rootfs_sha256=040927105bd01b19e7b02cd5da5a9552b428a7f84bd5ffc22ebfce4ddf258a07
 packages=busybox,nodejs
 entrypoint=/init
-worker=/zeroboot/worker_node.js
+worker=/zeroboot/worker_supervisor.js
 runtime_binary=/usr/bin/node
-runtime_version=REQUIRED
+runtime_version=20.20.2
