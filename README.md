@@ -102,7 +102,7 @@ This is explicit because upstream no longer publishes an Ubuntu 22.04 artifact s
 
 > **Important:** This repo is the **runtime** for XBOOT. It does **not** include guest artifacts (kernel, rootfs) by default. You need to provide these or build them.
 
-The pinned first-pass artifact set is recorded in [runtime-artifacts.lock.json](/Users/dawsonblock/Downloads/XBOOT-main-2/manifests/runtime-artifacts.lock.json) and can be fetched with:
+The pinned first-pass artifact set is recorded in [runtime-artifacts.lock.json](manifests/runtime-artifacts.lock.json) and can be fetched with:
 
 ```bash
 bash scripts/fetch_official_artifacts.sh /var/lib/zeroboot/artifacts
