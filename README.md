@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <strong>Production-hardened snapshot-forked KVM sandboxes with structured guest protocol</strong>
+  <strong>Controlled-internal snapshot-forked KVM sandboxes with structured guest protocol</strong>
 </p>
 
 <p align="center">
@@ -26,11 +26,11 @@
 
 ## What is XBOOT?
 
-XBOOT is a **production-ready** VM sandbox system that provides sub-millisecond code execution by combining:
+XBOOT is a VM sandbox system aimed at **controlled internal use** on **Ubuntu 22.04 x86_64 with KVM**, pinned to **Firecracker 1.12.0**. The first hardened release is **offline-only** and provides sub-millisecond code execution by combining:
 
 - **Snapshot-based KVM restore** with copy-on-write memory mapping
 - **Framed host↔guest protocol** with length-prefixed frames and FNV-1a checksums
-- **Per-request guest workers** (Python & Node.js) with subprocess isolation
+- **Per-request guest workers** (Python & Node.js) with supervisor/child subprocess isolation
 - **Production-grade security** including hashed API keys, template signing, and systemd confinement
 - **Versioned deployments** with automatic rollback
 
@@ -79,16 +79,34 @@ This subprocess-based model ensures:
 | Feature | Description |
 |---------|-------------|
 | Fast Fork | Sub-millisecond VM instantiation via KVM snapshot restore + CoW |
-| Production Hardened | Signed templates, hashed auth, strict verification modes |
+| Hardened First Pass | Signed templates, hashed auth, strict verification modes, fail-closed startup |
 | Versioned Deployments | Immutable releases with rollback on failure |
 | Observability | Prometheus metrics, structured logging, health probes |
 | Security | Systemd sandboxing, resource limits, path confinement |
+
+### Pinned Artifact Matrix
+
+The repo-owned first-pass matrix is:
+
+- Firecracker `1.12.0` x86_64 release binary
+- guest kernel `vmlinux-5.10.223`
+- base Ubuntu 22.04 ext4 rootfs from the official Firecracker CI bucket
+- Python `3.10.12` from that Ubuntu base rootfs
+- Node.js `20.20.2` installed from the official Node.js Linux x64 tarball
+
+This is explicit because upstream no longer publishes an Ubuntu 22.04 artifact set under the Firecracker `v1.12` CI prefix.
 
 ---
 
 ## Quick Start
 
 > **Important:** This repo is the **runtime** for XBOOT. It does **not** include guest artifacts (kernel, rootfs) by default. You need to provide these or build them.
+
+The pinned first-pass artifact set is recorded in [runtime-artifacts.lock.json](manifests/runtime-artifacts.lock.json) and can be fetched with:
+
+```bash
+bash scripts/fetch_official_artifacts.sh /var/lib/zeroboot/artifacts
+```
 
 ### Option A: Code-Only Testing
 
@@ -121,8 +139,14 @@ make guest-python
 make image-python
 make template-python
 
+# For Node guest images, install the pinned Node runtime into your rootfs template tree first
+bash scripts/install_node_runtime.sh /path/to/base-rootfs-tree /var/lib/zeroboot/artifacts
+make guest-node NODE_ROOTFS_TEMPLATE=/path/to/base-rootfs-tree
+make image-node
+make template-node
+
 # Run locally
-./target/release/zeroboot serve python:/path/to/template 8080
+./target/release/zeroboot serve python:/var/lib/zeroboot/current/templates/python 8080
 
 # Or with test execution
 ./target/release/zeroboot test-exec /path/to/template python "print(1+1)"
@@ -139,6 +163,8 @@ For production deployments, set these:
 | `ZEROBOOT_REQUIRE_TEMPLATE_HASHES` | Enforce template hash verification | `false` in dev |
 | `ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES` | Enforce template signatures | `false` in dev |
 | `ZEROBOOT_KEYRING_PATH` | Path to signing keyring | none |
+| `ZEROBOOT_MIN_FREE_BYTES` | Minimum free space before readiness/execution refuse | `536870912` |
+| `ZEROBOOT_MIN_FREE_INODES` | Minimum free inodes before readiness/execution refuse | `10000` |
 
 ---
 
@@ -218,7 +244,7 @@ ZEROBOOT_READY proto=ZB1 worker_python=1 worker_node=1
 | Variable | Default | Description |
 |----------|---------|-------------|
 | ZEROBOOT_AUTH_MODE | dev | Authentication mode (dev or prod) |
-| ZEROBOOT_API_KEYS_FILE | api_keys.json | Path to API key records |
+| ZEROBOOT_API_KEYS_FILE | api_keys.json | Path to hashed API key records |
 | ZEROBOOT_API_KEY_PEPPER_FILE | /etc/zeroboot/pepper | HMAC pepper secret |
 | ZEROBOOT_REQUIRE_TEMPLATE_HASHES | false | Enforce artifact hashes |
 | ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES | false | Enforce manifest signatures |
@@ -244,9 +270,10 @@ SERVERS="prod1 prod2" ./deploy/deploy.sh
 
 # The script:
 # 1. Creates immutable release directory
-# 2. Runs smoke test before switching
-# 3. Atomically switches symlink
-# 4. Rolls back on health check failure
+# 2. Verifies staged templates through `verify-startup`
+# 3. Runs smoke test before switching
+# 4. Atomically switches `current`
+# 5. Rolls back on health check failure
 ```
 
 ### Systemd Service
@@ -284,9 +311,11 @@ XBOOT/
 │   └── api/
 │       └── handlers.rs     # HTTP request handlers
 ├── guest/
-│   ├── init.c               # Guest supervisor (with setrlimit)
-│   ├── worker.py            # Python worker
-│   └── worker_node.js       # Node.js worker
+│   ├── init.c               # Guest init and worker launcher
+│   ├── worker_supervisor.py # Python supervisor
+│   ├── worker_child.py      # Python child executor
+│   ├── worker_supervisor.js # Node supervisor
+│   └── worker_child.js      # Node child executor
 ├── deploy/
 │   ├── deploy.sh            # Versioned deployment script
 │   └── zeroboot.service     # Systemd unit

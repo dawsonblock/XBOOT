@@ -8,6 +8,23 @@
 - one or more guest rootfs images with the worker assets installed
 - templates created by this upgraded build so `template.manifest.json` includes sha256 fields
 
+## Official artifact set
+
+Fetch the pinned Ubuntu 22.04 / Firecracker 1.12.0 artifact set with:
+
+```bash
+bash scripts/fetch_official_artifacts.sh /var/lib/zeroboot/artifacts
+```
+
+That downloads and verifies:
+
+- Firecracker `1.12.0` x86_64
+- guest kernel `vmlinux-5.10.223`
+- base Ubuntu 22.04 rootfs `ubuntu-22.04.ext4`
+- Node.js runtime tarball `v20.20.2`
+
+The exact URLs and sha256 values are also locked in [runtime-artifacts.lock.json](../manifests/runtime-artifacts.lock.json).
+
 ## Recommended environment
 
 ```bash
@@ -32,7 +49,11 @@ export ZEROBOOT_KEYRING_PATH=/etc/zeroboot/keyring.json
 export ZEROBOOT_ALLOWED_FIRECRACKER_VERSION="1.12.0"
 export ZEROBOOT_ALLOWED_FC_BINARY_SHA256=<sha256-of-firecracker-binary>
 export ZEROBOOT_RELEASE_CHANNEL=prod
+export ZEROBOOT_MIN_FREE_BYTES=$((512 * 1024 * 1024))
+export ZEROBOOT_MIN_FREE_INODES=10000
 ```
+
+This first hardened release is **offline-only**. The current Firecracker path does not configure a guest NIC, so networked execution profiles are intentionally deferred.
 
 ## Build flow
 
@@ -43,6 +64,15 @@ make image-python
 make template-python
 ```
 
+For Node guest images, install the pinned Node runtime into the template tree first:
+
+```bash
+bash scripts/install_node_runtime.sh /path/to/base-rootfs-tree /var/lib/zeroboot/artifacts
+make guest-node NODE_ROOTFS_TEMPLATE=/path/to/base-rootfs-tree
+make image-node
+make template-node
+```
+
 `make guest-python` and `make guest-node` build deterministic staging trees under `build/staging/...`.
 `make image-python` and `make image-node` turn those staging trees into ext4 artifacts with `mkfs.ext4 -d`.
 `template.manifest.json` now records language, protocol version, Firecracker version, and sha256 hashes for kernel, rootfs, and snapshot files.
@@ -50,7 +80,7 @@ make template-python
 ## Start the server
 
 ```bash
-./target/release/zeroboot serve "python:/var/lib/zeroboot/templates/python,node:/var/lib/zeroboot/templates/node" 8080
+./target/release/zeroboot serve "python:/var/lib/zeroboot/current/templates/python,node:/var/lib/zeroboot/current/templates/node" 8080
 ```
 
 At startup the server now:
@@ -71,7 +101,8 @@ Useful probes:
 
 Use `deploy/zeroboot.service` as the baseline. It now:
 
-- points at `/var/lib/zeroboot/templates/...`
+- points at `/var/lib/zeroboot/current/templates/...`
+- runs `verify-startup` in `ExecStartPre=` before the API process is marked ready
 - supports an optional `/etc/zeroboot/zeroboot.env`
 - enables strict template hash verification by default
 - sets conservative restart and memory limits
@@ -79,10 +110,21 @@ Use `deploy/zeroboot.service` as the baseline. It now:
 ## Preflight
 
 Run `scripts/preflight.sh` against the kernel and rootfs artifacts before deployment.
-Generate API keys with `scripts/make_api_keys.py --output api_keys.json`.
+Generate API keys with `scripts/make_api_keys.py --pepper-file /etc/zeroboot/pepper --output api_keys.json`.
 
 If `ZEROBOOT_WORKDIR` points at a template directory, `preflight.sh` also validates `template.manifest.json`.
-If `ZEROBOOT_ALLOWED_FIRECRACKER_VERSION` is set, `preflight.sh` rejects mismatched Firecracker binaries.
+If `ZEROBOOT_ALLOWED_FIRECRACKER_VERSION` or `ZEROBOOT_ALLOWED_FC_BINARY_SHA256` is set, `preflight.sh` rejects mismatched Firecracker binaries.
+If `ZEROBOOT_MIN_FREE_BYTES` or `ZEROBOOT_MIN_FREE_INODES` is set, `preflight.sh` rejects nodes below the watermark.
+
+## Release layout
+
+Deployments use one runtime-facing root only:
+
+- `/var/lib/zeroboot/current/bin/zeroboot`
+- `/var/lib/zeroboot/current/templates/python`
+- `/var/lib/zeroboot/current/templates/node`
+
+`deploy/deploy.sh` stages a new immutable release under `releases/<id>`, verifies it, flips `current`, and restarts the service. Rollback is one symlink flip plus a restart.
 
 ## Production Mode Startup Verification
 
@@ -113,5 +155,5 @@ The `/v1/metrics` endpoint exposes Prometheus metrics including:
 ## Remaining gaps
 
 - no warm VM pool yet (experimental)
-- no live KVM/Firecracker CI lane yet
+- the KVM CI lane requires a real Ubuntu 22.04 x86_64 self-hosted runner with `/dev/kvm`
 - not proven for hostile public multitenancy

@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
-"""
-Subprocess-based Python worker supervisor.
-
-This module runs as a long-lived supervisor process that spawns a new child executor
-for each request. The child process is terminated and recreated after each request,
-providing strong isolation between requests.
-"""
-
+import json
 import os
 import subprocess
 import sys
-import uuid
 
-# Maximum time to wait for child to start (ms)
-CHILD_STARTUP_TIMEOUT_MS = 1000
 MAX_STDOUT = 64 * 1024
 MAX_STDERR = 64 * 1024
 FLAG_STDOUT_TRUNCATED = 1
 FLAG_STDERR_TRUNCATED = 2
-FLAG_RECYCLE_REQUESTED = 4
+CHILD_TMP_BYTES = 16 * 1024 * 1024
+CHILD_MEMORY_BYTES = 512 * 1024 * 1024
+CHILD_NOFILE = 64
+CHILD_NPROC = 16
+CHILD_FSIZE_BYTES = 2 * 1024 * 1024
 
 
 def read_exact(n: int) -> bytes:
@@ -38,10 +32,12 @@ def read_line() -> str:
     return line.decode("utf-8", "replace").strip()
 
 
-def truncate(data: bytes, limit: int):
+def truncate_with_marker(data: bytes, limit: int, marker: bytes):
     if len(data) <= limit:
         return data, False
-    return data[:limit], True
+    if limit <= len(marker):
+        return marker[:limit], True
+    return data[: limit - len(marker)] + marker, True
 
 
 def write_response(request_id: bytes, exit_code: int, error_type: str, stdout: bytes, stderr: bytes, flags: int) -> None:
@@ -53,178 +49,128 @@ def write_response(request_id: bytes, exit_code: int, error_type: str, stdout: b
     sys.stdout.buffer.flush()
 
 
-def spawn_child_executor(timeout_ms: int, code: str, stdin_data: str) -> tuple:
-    """
-    Spawn a child process to execute code with strict isolation.
-    Returns (exit_code, error_type, stdout, stderr, flags)
-    """
-    # Create a temporary script that will be executed by the child
-    import tempfile
-    import json
-    
-    # Write execution request to temp file
-    exec_request = {
-        "timeout_ms": timeout_ms,
-        "code": code,
-        "stdin": stdin_data,
+def minimal_child_env() -> dict:
+    path = os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
+    return {
+        "PATH": path,
+        "HOME": "/tmp",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "ZEROBOOT_OFFLINE": "1",
     }
-    
-    # Use a simple approach: pass code via environment to avoid temp files
-    # For true isolation, the child should be a fresh Python process
-    child_script = os.environ.get("ZEROBOOT_CHILD_SCRIPT", "/usr/local/bin/zeroboot-python-worker")
-    
-    env = os.environ.copy()
-    env["ZEROBOOT_EXEC_CODE"] = code
-    env["ZEROBOOT_EXEC_STDIN"] = stdin_data
-    env["ZEROBOOT_EXEC_TIMEOUT_MS"] = str(timeout_ms)
-    
+
+
+def parse_child_response(data: bytes):
+    newline = data.find(b"\n")
+    if newline < 0:
+        raise ValueError("invalid child response")
+    header = data[:newline].decode("utf-8", "replace").strip().split()
+    if len(header) != 7 or header[0] != "WRK1R":
+        raise ValueError("malformed child response")
+    request_id_len = int(header[1])
+    stdout_len = int(header[4])
+    stderr_len = int(header[5])
+    payload = data[newline + 1 + request_id_len :]
+    stdout = payload[:stdout_len]
+    stderr = payload[stdout_len : stdout_len + stderr_len]
+    return int(header[2]), header[3], stdout, stderr, int(header[6])
+
+
+def child_command(timeout_ms: int) -> list[str]:
+    child_script = os.environ.get("ZEROBOOT_CHILD_SCRIPT", "/zeroboot/worker_child.py")
+    python_bin = os.environ.get("ZEROBOOT_PYTHON_BIN", "python3")
+    cpu_seconds = max(1, int((timeout_ms + 1999) / 1000))
+    memory_kib = max(1, CHILD_MEMORY_BYTES // 1024)
+    file_kib = max(1, CHILD_FSIZE_BYTES // 1024)
+    shell = (
+        f"ulimit -t {cpu_seconds}; "
+        f"ulimit -v {memory_kib}; "
+        f"ulimit -n {CHILD_NOFILE}; "
+        f"ulimit -u {CHILD_NPROC}; "
+        f"ulimit -f {file_kib}; "
+        f"exec {python_bin} {child_script}"
+    )
+    return ["/bin/sh", "-c", shell]
+
+
+def spawn_child_executor(request_id: str, timeout_ms: int, code: str, stdin_data: str):
+    payload = json.dumps(
+        {
+            "request_id": request_id,
+            "timeout_ms": timeout_ms,
+            "code": code,
+            "stdin": stdin_data,
+            "limits": {
+                "stdout_bytes": MAX_STDOUT,
+                "stderr_bytes": MAX_STDERR,
+                "tmp_bytes": CHILD_TMP_BYTES,
+                "memory_bytes": CHILD_MEMORY_BYTES,
+                "nofile": CHILD_NOFILE,
+                "nproc": CHILD_NPROC,
+                "fsize_bytes": CHILD_FSIZE_BYTES,
+            },
+        }
+    ).encode("utf-8")
+
     try:
-        # Try to use the dedicated child script if available
         result = subprocess.run(
-            [child_script],
-            input=b"",
+            child_command(timeout_ms),
+            input=payload,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=max(timeout_ms / 1000.0 + 1, 5),  # Add buffer to timeout
-            env=env,
+            timeout=max(timeout_ms / 1000.0 + 2.0, 5.0),
+            env=minimal_child_env(),
         )
-        stdout = result.stdout
-        stderr = result.stderr
-        exit_code = result.returncode
-        
-        # Check if child script returned valid response
-        if stdout.startswith(b"WRK1R "):
-            return parse_child_response(stdout)
-        
-        # Fall back to treating output as stdout/stderr
-        error_type = "ok" if exit_code == 0 else "runtime"
-        
-    except FileNotFoundError:
-        # Child script doesn't exist, use inline execution (less secure but functional)
-        return execute_inline(timeout_ms, code, stdin_data)
     except subprocess.TimeoutExpired:
-        return -1, "timeout", b"", b"execution timed out", FLAG_RECYCLE_REQUESTED
-    except Exception as e:
-        return -1, "internal", b"", str(e).encode("utf-8")[:MAX_STDERR], FLAG_STDERR_TRUNCATED
-    
-    return exit_code, error_type, stdout, stderr, 0
+        return -1, "timeout", b"", b"execution timed out\n", 0
+    except Exception as exc:  # pragma: no cover - hard failure path
+        return -1, "internal", b"", str(exc).encode("utf-8", "replace"), 0
 
+    if result.stdout.startswith(b"WRK1R "):
+        return parse_child_response(result.stdout)
 
-def parse_child_response(data: bytes) -> tuple:
-    """Parse response from child executor."""
-    lines = data.split(b'\n', 1)
-    if not lines[0].startswith(b"WRK1R "):
-        return -1, "internal", b"", b"invalid child response", FLAG_STDERR_TRUNCATED
-    
-    parts = lines[0].decode("utf-8").split()
-    if len(parts) < 7:
-        return -1, "internal", b"", b"malformed child response", FLAG_STDERR_TRUNCATED
-    
-    exit_code = int(parts[2])
-    error_type = parts[3]
-    stdout_len = int(parts[4])
-    stderr_len = int(parts[5])
-    flags = int(parts[6])
-    
-    stdout = b""
-    stderr = b""
-    if len(lines) > 1:
-        remaining = lines[1]
-        stdout = remaining[:stdout_len]
-        stderr = remaining[stdout_len:stdout_len + stderr_len]
-    
-    return exit_code, error_type, stdout, stderr, flags
-
-
-def execute_inline(timeout_ms: int, code: str, stdin_data: str) -> tuple:
-    """
-    Fallback inline execution (less secure but works when child script unavailable).
-    This is here for development/testing - production should use child process.
-    """
-    import builtins
-    import contextlib
-    import gc
-    import io
-    import signal
-    import traceback
-    
-    def timeout_handler(_signum, _frame):
-        raise TimeoutError("execution timed out")
-    
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.setitimer(signal.ITIMER_REAL, max(timeout_ms, 1) / 1000.0)
-    
-    stdout_io = io.StringIO()
-    stderr_io = io.StringIO()
-    globals_dict = {"__name__": "__main__", "__builtins__": builtins}
-    locals_dict = globals_dict
-    exit_code = 0
-    error_type = "ok"
-    
-    old_stdin = sys.stdin
-    try:
-        sys.stdin = io.StringIO(stdin_data)
-        with contextlib.redirect_stdout(stdout_io), contextlib.redirect_stderr(stderr_io):
-            exec(compile(code, "<zeroboot>", "exec"), globals_dict, locals_dict)
-    except TimeoutError:
-        exit_code = -1
-        error_type = "timeout"
-        stderr_io.write("execution timed out\n")
-    except BaseException:
-        exit_code = 1
-        error_type = "runtime"
-        traceback.print_exc(file=stderr_io)
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        sys.stdin = old_stdin
-        gc.collect()
-    
-    stdout_bytes = stdout_io.getvalue().encode("utf-8", "replace")
-    stderr_bytes = stderr_io.getvalue().encode("utf-8", "replace")
+    stdout, stdout_truncated = truncate_with_marker(
+        result.stdout, MAX_STDOUT, b"\n[truncated]\n"
+    )
+    stderr, stderr_truncated = truncate_with_marker(
+        result.stderr, MAX_STDERR, b"\n[truncated]\n"
+    )
     flags = 0
-    
-    stdout_bytes, stdout_truncated = truncate(stdout_bytes, MAX_STDOUT)
-    stderr_bytes, stderr_truncated = truncate(stderr_bytes, MAX_STDERR)
     if stdout_truncated:
         flags |= FLAG_STDOUT_TRUNCATED
     if stderr_truncated:
         flags |= FLAG_STDERR_TRUNCATED
-    
-    return exit_code, error_type, stdout_bytes, stderr_bytes, flags
+    return result.returncode or 0, ("ok" if result.returncode == 0 else "runtime"), stdout, stderr, flags
 
 
-# Supervisor main loop
 print("READY", flush=True)
 
 while True:
     try:
-        header = read_line()
-        parts = header.split()
-        if len(parts) != 5 or parts[0] != "WRK1":
+        header = read_line().split()
+        if len(header) != 5 or header[0] != "WRK1":
             write_response(b"error", -1, "protocol", b"", b"invalid worker request header", 0)
             continue
-        id_len = int(parts[1])
-        timeout_ms = int(parts[2])
-        code_len = int(parts[3])
-        stdin_len = int(parts[4])
-        request_id = read_exact(id_len)
-        code = read_exact(code_len).decode("utf-8", "replace")
-        stdin_data = read_exact(stdin_len).decode("utf-8", "replace")
-
-        # Spawn child executor for this request
+        request_id = read_exact(int(header[1]))
+        timeout_ms = int(header[2])
+        code = read_exact(int(header[3])).decode("utf-8", "replace")
+        stdin_data = read_exact(int(header[4])).decode("utf-8", "replace")
         exit_code, error_type, stdout, stderr, flags = spawn_child_executor(
-            timeout_ms, code, stdin_data
+            request_id.decode("utf-8", "replace"),
+            timeout_ms,
+            code,
+            stdin_data,
         )
-        
-        # Always set recycle flag since we're using fresh process per request
-        # Actually, we can be smarter - if the child completed successfully, 
-        # we can reuse the supervisor. But for safety, let's recycle to be safe.
-        # The supervisor stays alive, we just spawn a new child each time.
         write_response(request_id, exit_code, error_type, stdout, stderr, flags)
-        
     except EOFError:
         break
-    except BaseException:
-        err = traceback.format_exc().encode("utf-8", "replace")
-        write_response(b"error", -1, "internal", b"", err[:MAX_STDERR], FLAG_STDERR_TRUNCATED | FLAG_RECYCLE_REQUESTED if len(err) > MAX_STDERR else FLAG_RECYCLE_REQUESTED)
+    except Exception as exc:  # pragma: no cover - supervisor crash path
+        write_response(
+            b"error",
+            -1,
+            "internal",
+            b"",
+            str(exc).encode("utf-8", "replace")[:MAX_STDERR],
+            FLAG_STDERR_TRUNCATED if len(str(exc).encode("utf-8", "replace")) > MAX_STDERR else 0,
+        )
         break

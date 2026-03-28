@@ -17,8 +17,8 @@ AUTH_MODE="${AUTH_MODE:-dev}"
 REQUIRE_TEMPLATE_HASHES="${REQUIRE_TEMPLATE_HASHES:-false}"
 REQUIRE_TEMPLATE_SIGNATURES="${REQUIRE_TEMPLATE_SIGNATURES:-false}"
 KEYRING_FILE="${KEYRING_FILE:-keyring.json}"
-PY_TEMPLATE_DIR="$REMOTE_ROOT/templates/python"
-NODE_TEMPLATE_DIR="$REMOTE_ROOT/templates/node"
+MIN_FREE_BYTES="${MIN_FREE_BYTES:-536870912}"
+MIN_FREE_INODES="${MIN_FREE_INODES:-10000}"
 
 # Release directory structure:
 # /var/lib/zeroboot/
@@ -79,6 +79,9 @@ for server in $SERVERS; do
   # Generate templates using the new release
   ssh "$server" "cd $REMOTE_ROOT/releases/$RELEASE_ID && sudo ZEROBOOT_AUTH_MODE=$AUTH_MODE ZEROBOOT_REQUIRE_TEMPLATE_HASHES=$REQUIRE_TEMPLATE_HASHES ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=$REQUIRE_TEMPLATE_SIGNATURES $REMOTE_ROOT/releases/$RELEASE_ID/bin/zeroboot template $REMOTE_ROOT/releases/$RELEASE_ID/vmlinux-fc $REMOTE_ROOT/releases/$RELEASE_ID/rootfs-python.ext4 $REMOTE_ROOT/releases/$RELEASE_ID/templates/python 20 /init 512"
   ssh "$server" "cd $REMOTE_ROOT/releases/$RELEASE_ID && sudo ZEROBOOT_AUTH_MODE=$AUTH_MODE ZEROBOOT_REQUIRE_TEMPLATE_HASHES=$REQUIRE_TEMPLATE_HASHES ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=$REQUIRE_TEMPLATE_SIGNATURES $REMOTE_ROOT/releases/$RELEASE_ID/bin/zeroboot template $REMOTE_ROOT/releases/$RELEASE_ID/vmlinux-fc $REMOTE_ROOT/releases/$RELEASE_ID/rootfs-node.ext4 $REMOTE_ROOT/releases/$RELEASE_ID/templates/node 20 /init 512"
+
+  echo "Running staged startup verification..."
+  ssh "$server" "sudo ZEROBOOT_AUTH_MODE=$AUTH_MODE ZEROBOOT_API_KEYS_FILE=/etc/zeroboot/api_keys.json ZEROBOOT_API_KEY_PEPPER_FILE=/etc/zeroboot/pepper ZEROBOOT_REQUIRE_TEMPLATE_HASHES=$REQUIRE_TEMPLATE_HASHES ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=$REQUIRE_TEMPLATE_SIGNATURES ZEROBOOT_KEYRING_PATH=/etc/zeroboot/keyring.json ZEROBOOT_ALLOWED_FIRECRACKER_VERSION=${ZEROBOOT_ALLOWED_FIRECRACKER_VERSION:-} ZEROBOOT_ALLOWED_FC_BINARY_SHA256=${ZEROBOOT_ALLOWED_FC_BINARY_SHA256:-} ZEROBOOT_RELEASE_CHANNEL=${ZEROBOOT_RELEASE_CHANNEL:-} ZEROBOOT_MIN_FREE_BYTES=$MIN_FREE_BYTES ZEROBOOT_MIN_FREE_INODES=$MIN_FREE_INODES $REMOTE_ROOT/releases/$RELEASE_ID/bin/zeroboot verify-startup \"python:$REMOTE_ROOT/releases/$RELEASE_ID/templates/python,node:$REMOTE_ROOT/releases/$RELEASE_ID/templates/node\" --release-root $REMOTE_ROOT/releases/$RELEASE_ID"
   
   # Run smoke test before switching
   echo "Running smoke test..."
@@ -98,8 +101,24 @@ for server in $SERVERS; do
   
   # Set environment for systemd service via drop-in or environment file
   ssh "$server" "echo 'ZEROBOOT_AUTH_MODE=$AUTH_MODE' | sudo tee /etc/zeroboot/env"
+  ssh "$server" "echo 'ZEROBOOT_API_KEYS_FILE=/etc/zeroboot/api_keys.json' | sudo tee -a /etc/zeroboot/env"
+  ssh "$server" "echo 'ZEROBOOT_API_KEY_PEPPER_FILE=/etc/zeroboot/pepper' | sudo tee -a /etc/zeroboot/env"
   ssh "$server" "echo 'ZEROBOOT_REQUIRE_TEMPLATE_HASHES=$REQUIRE_TEMPLATE_HASHES' | sudo tee -a /etc/zeroboot/env"
   ssh "$server" "echo 'ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=$REQUIRE_TEMPLATE_SIGNATURES' | sudo tee -a /etc/zeroboot/env"
+  ssh "$server" "echo 'ZEROBOOT_MIN_FREE_BYTES=$MIN_FREE_BYTES' | sudo tee -a /etc/zeroboot/env"
+  ssh "$server" "echo 'ZEROBOOT_MIN_FREE_INODES=$MIN_FREE_INODES' | sudo tee -a /etc/zeroboot/env"
+  if [[ -n "${ZEROBOOT_ALLOWED_FIRECRACKER_VERSION:-}" ]]; then
+    ssh "$server" "echo 'ZEROBOOT_ALLOWED_FIRECRACKER_VERSION=$ZEROBOOT_ALLOWED_FIRECRACKER_VERSION' | sudo tee -a /etc/zeroboot/env"
+  fi
+  if [[ -n "${ZEROBOOT_ALLOWED_FC_BINARY_SHA256:-}" ]]; then
+    ssh "$server" "echo 'ZEROBOOT_ALLOWED_FC_BINARY_SHA256=$ZEROBOOT_ALLOWED_FC_BINARY_SHA256' | sudo tee -a /etc/zeroboot/env"
+  fi
+  if [[ -n "${ZEROBOOT_RELEASE_CHANNEL:-}" ]]; then
+    ssh "$server" "echo 'ZEROBOOT_RELEASE_CHANNEL=$ZEROBOOT_RELEASE_CHANNEL' | sudo tee -a /etc/zeroboot/env"
+  fi
+  if [[ -f "$KEYRING_FILE" ]]; then
+    ssh "$server" "echo 'ZEROBOOT_KEYRING_PATH=/etc/zeroboot/keyring.json' | sudo tee -a /etc/zeroboot/env"
+  fi
   
   # Restart service
   ssh "$server" "sudo systemctl restart zeroboot"
@@ -115,7 +134,7 @@ for server in $SERVERS; do
       ssh "$server" "cd $REMOTE_ROOT && sudo ln -sfn releases/$PREV_RELEASE current"
       ssh "$server" "sudo systemctl restart zeroboot"
       sleep 2
-      ssh "$server" "curl -fsS http://127.0.0.1:$PORT/v1/ready" || {
+      ssh "$server" "curl -fsS http://127.0.0.1:$PORT/v1/ready && curl -fsS -X POST http://127.0.0.1:$PORT/v1/exec -H 'content-type: application/json' -d '{\"language\":\"python\",\"code\":\"print(40+2)\",\"timeout_seconds\":5}'" || {
         echo "ROLLBACK FAILED - manual intervention required!"
         exit 1
       }

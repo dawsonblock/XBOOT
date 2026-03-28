@@ -1,109 +1,84 @@
-"""
-Tests for guest worker subprocess isolation.
-
-These tests verify that the supervisor/child model properly isolates
-execution between requests.
-"""
-
+import json
 import subprocess
 import sys
-import tempfile
-import os
+import unittest
+from pathlib import Path
 
 
-def test_child_process_isolation():
-    """Test that child process is a fresh process for each execution."""
-    # This test verifies that if we pollute state in one execution,
-    # it doesn't affect the next execution because each runs in a fresh process
-    
-    # Note: In production, we use worker_supervisor.py which spawns worker_child.py
-    # for each request. This test just verifies the concept works.
-    
-    # Create a simple child script that checks for state pollution
-    child_code = """
-import os
-import sys
-
-# Check if we're a fresh process (no ZEROBOOT_EXEC_CODE should be in environment)
-if 'ZEROBOOT_EXEC_CODE' in os.environ:
-    print("FAIL: parent environment leaked to child")
-    sys.exit(1)
-else:
-    print("OK: child has clean environment")
-    sys.exit(0)
-"""
-
-    # Execute the child via environment
-    env = os.environ.copy()
-    env['ZEROBOOT_EXEC_CODE'] = child_code
-    env['ZEROBOOT_EXEC_STDIN'] = ''
-    env['ZEROBOOT_EXEC_TIMEOUT_MS'] = '5000'
-    
-    # Use a subprocess to run our child
-    result = subprocess.run(
-        [sys.executable, '-c', '''
-import os
-import sys
-code = os.environ.get("ZEROBOOT_EXEC_CODE", "")
-if code:
-    exec(code)
-'''],
-        env=env,
-        capture_output=True,
-        timeout=5,
-    )
-    
-    # The child should see its own environment, not the parent's
-    # This demonstrates the isolation concept
-    assert b"OK: child has clean environment" in result.stdout or b"parent environment leaked" not in result.stdout
+ROOT = Path(__file__).resolve().parents[1]
+CHILD = ROOT / "guest" / "worker_child.py"
 
 
-def test_no_persistent_state():
-    """Test that there's no persistent state between requests."""
-    # In the supervisor model, each request spawns a fresh child.
-    # This means there's no way for state to persist between requests
-    # unless explicitly shared (which we don't do).
-    
-    # This is verified by design - the supervisor spawns a new child process
-    # for each WRK1 request, and that child exits after responding.
-    
-    # We can verify this by checking that worker_child.py exits after execution
-    # (it has no loop, just executes once and exits)
-    
-    child_script = os.path.join(os.path.dirname(__file__), 'worker_child.py')
-    
-    # If worker_child.py exists and runs once, it should exit
-    if os.path.exists(child_script):
-        env = os.environ.copy()
-        env['ZEROBOOT_EXEC_CODE'] = 'print("test")'
-        env['ZEROBOOT_EXEC_STDIN'] = ''
-        env['ZEROBOOT_EXEC_TIMEOUT_MS'] = '5000'
-        
-        result = subprocess.run(
-            ['python3', child_script],
-            env=env,
+def parse_response(data: bytes):
+    header, payload = data.split(b"\n", 1)
+    parts = header.decode("utf-8").split()
+    request_id_len = int(parts[1])
+    exit_code = int(parts[2])
+    error_type = parts[3]
+    stdout_len = int(parts[4])
+    stderr_len = int(parts[5])
+    flags = int(parts[6])
+    request_id = payload[:request_id_len]
+    body = payload[request_id_len:]
+    stdout = body[:stdout_len]
+    stderr = body[stdout_len : stdout_len + stderr_len]
+    return request_id, exit_code, error_type, stdout, stderr, flags
+
+
+class GuestWorkerSubprocessTests(unittest.TestCase):
+    def run_child(self, code: str):
+        payload = {
+            "request_id": "t1",
+            "timeout_ms": 2000,
+            "code": code,
+            "stdin": "",
+            "limits": {
+                "stdout_bytes": 1024,
+                "stderr_bytes": 1024,
+                "tmp_bytes": 4096,
+                "memory_bytes": 256 * 1024 * 1024,
+                "nofile": 32,
+                "nproc": 8,
+                "fsize_bytes": 4096,
+            },
+        }
+        proc = subprocess.run(
+            [sys.executable, str(CHILD)],
+            input=json.dumps(payload).encode("utf-8"),
             capture_output=True,
             timeout=5,
         )
-        
-        # Child should exit after one execution
-        # (exit code may be 0 for success, but importantly it should terminate)
-        assert result.returncode is not None
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+        return parse_response(proc.stdout)
+
+    def test_child_does_not_expect_code_in_environment(self):
+        request_id, exit_code, error_type, stdout, _stderr, _flags = self.run_child(
+            "import os\nprint('ZEROBOOT_EXEC_CODE' in os.environ)"
+        )
+        self.assertEqual(request_id, b"t1")
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(error_type, "ok")
+        self.assertEqual(stdout.strip(), b"False")
+
+    def test_child_exits_after_one_execution(self):
+        request_id, exit_code, error_type, stdout, _stderr, _flags = self.run_child('print("test")')
+        self.assertEqual(request_id, b"t1")
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(error_type, "ok")
+        self.assertEqual(stdout.strip(), b"test")
+
+    def test_temp_directory_is_scoped_per_request(self):
+        code = (
+            "import os\n"
+            "tmp = os.environ['ZEROBOOT_TMPDIR']\n"
+            "open(os.path.join(tmp, 'note.txt'), 'w').write('hello')\n"
+            "print(os.path.exists(os.path.join(tmp, 'note.txt')))\n"
+        )
+        _, exit_code, error_type, stdout, _stderr, _flags = self.run_child(code)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(error_type, "ok")
+        self.assertEqual(stdout.strip(), b"True")
 
 
-def test_scratch_directory_reset():
-    """Test that scratch directory is reset for each request."""
-    # In the subprocess model, each child gets a fresh filesystem view
-    # We can verify this by having a child create a file, then checking
-    # that the next child doesn't see it.
-    
-    # This is verified by design in the subprocess model - each child
-    # is a completely separate process with its own filesystem namespace
-    pass  # Verified by subprocess isolation
-
-
-if __name__ == '__main__':
-    test_child_process_isolation()
-    test_no_persistent_state()
-    test_scratch_directory_reset()
-    print("All isolation tests passed!")
+if __name__ == "__main__":
+    unittest.main()

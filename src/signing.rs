@@ -336,7 +336,10 @@ pub fn canonical_manifest_payload(
     let mut seen = std::collections::HashSet::new();
     for field in signed_fields {
         if !seen.insert(field) {
-            bail!("cannot create canonical payload: duplicate field '{}'", field);
+            bail!(
+                "cannot create canonical payload: duplicate field '{}'",
+                field
+            );
         }
     }
 
@@ -451,9 +454,15 @@ mod tests {
         });
 
         // Sign with fields in different order - should produce same payload
-        let payload1 = canonical_manifest_payload(&manifest, &["template_id", "build_id", "artifact_set_id"]).unwrap();
-        let payload2 = canonical_manifest_payload(&manifest, &["artifact_set_id", "template_id", "build_id"]).unwrap();
-        let payload3 = canonical_manifest_payload(&manifest, &["build_id", "artifact_set_id", "template_id"]).unwrap();
+        let payload1 =
+            canonical_manifest_payload(&manifest, &["template_id", "build_id", "artifact_set_id"])
+                .unwrap();
+        let payload2 =
+            canonical_manifest_payload(&manifest, &["artifact_set_id", "template_id", "build_id"])
+                .unwrap();
+        let payload3 =
+            canonical_manifest_payload(&manifest, &["build_id", "artifact_set_id", "template_id"])
+                .unwrap();
 
         assert_eq!(payload1, payload2);
         assert_eq!(payload2, payload3);
@@ -474,7 +483,8 @@ mod tests {
             "m_field": "m"
         });
 
-        let payload = canonical_manifest_payload(&manifest, &["z_field", "a_field", "m_field"]).unwrap();
+        let payload =
+            canonical_manifest_payload(&manifest, &["z_field", "a_field", "m_field"]).unwrap();
         let payload_str = String::from_utf8_lossy(&payload);
 
         // Should be sorted lexicographically

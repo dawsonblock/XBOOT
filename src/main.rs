@@ -3,10 +3,11 @@ mod auth;
 mod config;
 mod protocol;
 mod signing;
+mod startup;
 mod template_manifest;
 mod vmm;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use axum::extract::DefaultBodyLimit;
 use std::path::Path;
 use std::ptr;
@@ -19,7 +20,7 @@ use api::handlers::{
 };
 use config::{AuthMode, ServerConfig};
 use protocol::GuestRequest;
-use template_manifest::{verify_template_artifacts, ManifestPolicy, VerificationMode};
+use template_manifest::{ManifestPolicy, VerificationMode};
 use vmm::firecracker;
 use vmm::kvm::{create_snapshot_memfd, ForkedVm, VmSnapshot};
 use vmm::vmstate;
@@ -32,6 +33,7 @@ fn main() -> Result<()> {
         "bench" | "fork-bench" => cmd_fork_bench(&args[2..]),
         "serve" => cmd_serve(&args[2..]),
         "test-exec" => cmd_test_exec(&args[2..]),
+        "verify-startup" => cmd_verify_startup(&args[2..]),
         "sign" => cmd_sign(&args[2..]),
         "keygen" => cmd_keygen(&args[2..]),
         _ => {
@@ -40,6 +42,7 @@ fn main() -> Result<()> {
             eprintln!("  bench <workdir> [language]");
             eprintln!("  test-exec <workdir> [language] <code>");
             eprintln!("  serve <workdir>[,lang:workdir2,...] [port]");
+            eprintln!("  verify-startup <workdir>[,lang:workdir2,...] [--release-root <path>]");
             eprintln!("  sign <key> <manifest>");
             eprintln!("  keygen");
             Ok(())
@@ -49,7 +52,7 @@ fn main() -> Result<()> {
 
 /// Build a ManifestPolicy from optional config.
 /// This centralizes verification policy construction.
-fn manifest_policy(config: Option<&ServerConfig>) -> ManifestPolicy {
+fn manifest_policy(config: Option<&ServerConfig>) -> ManifestPolicy<'_> {
     match config {
         Some(cfg) => ManifestPolicy::from_config(cfg),
         None => ManifestPolicy::dev(),
@@ -68,6 +71,7 @@ fn validate_snapshot_workdir(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn load_snapshot(
     workdir: &str,
     expected_language: Option<&str>,
@@ -106,8 +110,8 @@ fn load_snapshot(
 
     // Pre-restore validation: verify vmstate before any KVM mutation
     // This is the first line of defense against corrupt/mismatched snapshots
-    let firecracker_version = config
-        .and_then(|c| c.artifacts.allowed_firecracker_version.as_deref());
+    let firecracker_version =
+        config.and_then(|c| c.artifacts.allowed_firecracker_version.as_deref());
     if let Some(cfg) = config {
         if let Some(firecracker_version) = cfg.artifacts.allowed_firecracker_version.as_deref() {
             if let Err(e) = vmstate::pre_restore_validate(
@@ -145,6 +149,15 @@ fn load_snapshot(
         },
         memfd,
     ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn load_snapshot(
+    _workdir: &str,
+    _expected_language: Option<&str>,
+    _config: Option<&ServerConfig>,
+) -> Result<(VmSnapshot, i32)> {
+    bail!("snapshot restore is only supported on Linux hosts with /dev/kvm")
 }
 
 fn cmd_template(args: &[String]) -> Result<()> {
@@ -419,16 +432,15 @@ fn cmd_serve(args: &[String]) -> Result<()> {
 
     // Validate startup configuration - fail-closed in prod mode
     config.validate_startup()?;
+    let parsed_specs = startup::parse_template_specs(&args[0], None)?;
+    startup::verify_startup(&config, &parsed_specs, None)?;
 
     let mut templates = std::collections::HashMap::new();
     let mut template_statuses = std::collections::HashMap::new();
     let mut quarantined = 0u64;
-    for spec in args[0].split(',') {
-        let (lang, dir) = if let Some((l, d)) = spec.split_once(':') {
-            (l.to_string(), d.to_string())
-        } else {
-            ("python".to_string(), spec.to_string())
-        };
+    for spec in &parsed_specs {
+        let lang = spec.language.clone();
+        let dir = spec.workdir.display().to_string();
 
         match validate_snapshot_workdir(&dir, Some(&lang), Some(&config)) {
             Ok(()) => {
@@ -447,6 +459,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
                     api::handlers::TemplateStatus {
                         ready: true,
                         detail: "startup verification ok".into(),
+                        health: api::handlers::TemplateHealth::Healthy,
                     },
                 );
             }
@@ -458,6 +471,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
                     api::handlers::TemplateStatus {
                         ready: false,
                         detail: format!("quarantined: {}", e),
+                        health: api::handlers::TemplateHealth::QuarantinedTrust,
                     },
                 );
             }
@@ -485,6 +499,10 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     eprintln!("  Queue wait timeout: {} ms", config.queue.wait_timeout_ms);
     eprintln!("  Health cache TTL: {} s", config.health.cache_ttl_secs);
     eprintln!(
+        "  Disk watermarks: free_bytes>={} free_inodes>={}",
+        config.storage.min_free_bytes, config.storage.min_free_inodes
+    );
+    eprintln!(
         "  Require template hashes: {}",
         config.artifacts.require_template_hashes
     );
@@ -493,7 +511,8 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     }
     apply_request_log_path_fix(&config.logging.path);
 
-    let (request_log_tx, mut request_log_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (request_log_tx, mut request_log_rx) =
+        tokio::sync::mpsc::channel::<String>(config.storage.request_log_queue_capacity);
     let metrics = Metrics::new();
     metrics
         .template_quarantines
@@ -509,9 +528,11 @@ fn cmd_serve(args: &[String]) -> Result<()> {
         )),
         request_log_tx,
         health_cache: std::sync::Mutex::new(None),
+        admission_paths: startup::runtime_admission_paths(&config, &parsed_specs),
         config: config.clone(),
     });
     let logger_config = config.clone();
+    let logger_state = state.clone();
     let bind_addr = config.bind_addr.clone();
     let max_request_body_bytes = config.limits.max_request_body_bytes;
 
@@ -536,9 +557,19 @@ fn cmd_serve(args: &[String]) -> Result<()> {
                         .open(&logger_config.logging.path)
                         .ok()
                         .map(std::io::BufWriter::new);
+                    if writer.is_none() {
+                        logger_state
+                            .metrics
+                            .request_log_write_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 if let Some(w) = writer.as_mut() {
                     if writeln!(w, "{}", line).is_err() {
+                        logger_state
+                            .metrics
+                            .request_log_write_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         writer = None;
                     } else {
                         let _ = w.flush();
@@ -573,6 +604,43 @@ fn cmd_serve(args: &[String]) -> Result<()> {
         .unwrap();
         eprintln!("Server shutdown complete");
     });
+    Ok(())
+}
+
+fn cmd_verify_startup(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!(
+            "Usage: zeroboot verify-startup <workdir>[,lang:workdir2,...] [--release-root <path>]"
+        );
+    }
+    let mut template_spec = None;
+    let mut release_root = None;
+    let mut idx = 0usize;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--release-root" => {
+                let value = args
+                    .get(idx + 1)
+                    .context("--release-root requires a path argument")?;
+                release_root = Some(Path::new(value));
+                idx += 2;
+            }
+            other if template_spec.is_none() => {
+                template_spec = Some(other.to_string());
+                idx += 1;
+            }
+            other => bail!("unexpected argument: {}", other),
+        }
+    }
+
+    let config = ServerConfig::from_env()?;
+    let template_spec = template_spec.context("missing template spec")?;
+    let parsed_specs = startup::parse_template_specs(&template_spec, release_root)?;
+    startup::verify_startup(&config, &parsed_specs, release_root)?;
+    println!("startup verification ok");
+    for spec in parsed_specs {
+        println!("  {} {}", spec.language, spec.workdir.display());
+    }
     Ok(())
 }
 
@@ -636,7 +704,7 @@ fn cmd_keygen(args: &[String]) -> Result<()> {
     println!();
     println!("To add to keyring, add this to your keyring.json:");
     println!("{{");
-    println!("  \"id\": \"{}\",", key_id);
+    println!("  \"key_id\": \"{}\",", key_id);
     println!("  \"algorithm\": \"ed25519\",");
     println!(
         "  \"public_key\": \"{}\",",
@@ -701,7 +769,11 @@ fn cmd_sign(args: &[String]) -> Result<()> {
 
     println!("Manifest signed with key ID: {}", key_id);
     println!("Signature: {}", signature);
-    println!("Signed fields ({}): {:?}", signed_fields.len(), signed_fields);
+    println!(
+        "Signed fields ({}): {:?}",
+        signed_fields.len(),
+        signed_fields
+    );
 
     Ok(())
 }

@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKER = ROOT / 'guest' / 'worker.py'
+WORKER = ROOT / 'guest' / 'worker_supervisor.py'
+CHILD = ROOT / 'guest' / 'worker_child.py'
 
 class WorkerProtocolTests(unittest.TestCase):
     def run_worker(self, code: str, timeout_ms: int = 2000):
@@ -14,7 +15,12 @@ class WorkerProtocolTests(unittest.TestCase):
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            env={**os.environ, 'ZEROBOOT_WORKER_MAX_REQUESTS': '32'},
+            env={
+                **os.environ,
+                'ZEROBOOT_WORKER_MAX_REQUESTS': '32',
+                'ZEROBOOT_CHILD_SCRIPT': str(CHILD),
+                'ZEROBOOT_PYTHON_BIN': sys.executable,
+            },
         )
         ready = proc.stdout.readline().decode().strip()
         self.assertEqual(ready, 'READY')
@@ -57,7 +63,7 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(exit_code, -1)
         self.assertEqual(error_type, 'timeout')
         self.assertIn('timed out', stderr)
-        self.assertNotEqual(flags & 4, 0)
+        self.assertEqual(flags & 4, 0)
 
 if __name__ == '__main__':
     unittest.main()

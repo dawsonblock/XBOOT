@@ -109,14 +109,44 @@ Two modes exist:
 Keys file format:
 
 ```json
-["zb_live_key1", "zb_live_key2"]
+[
+  {
+    "id": "key_ab12cd34",
+    "prefix": "zb_live_ab12cd34",
+    "hash": "8f7b9b0d9c1a...",
+    "created_at": 1711200000000,
+    "disabled_at": null,
+    "label": "deploy-1"
+  }
+]
 ```
 
 Use the standard bearer header:
 
 ```text
-Authorization: Bearer zb_live_key1
+Authorization: Bearer zb_live_ab12cd34.secret-material
 ```
+
+Generate records with:
+
+```bash
+python3 scripts/make_api_keys.py --pepper-file /etc/zeroboot/pepper --output /etc/zeroboot/api_keys.json
+```
+
+The script prints bearer tokens once and stores only hashed records on disk.
+
+## Rate limits and overload behavior
+
+- invalid or missing bearer token: `401`
+- tenant rate limit exceeded: `429`
+- execution queue full: `429`
+- runtime admission refused because disk or inode watermarks are below threshold: `503`
+
+Timeout responses return:
+
+- `exit_code: -1`
+- `runtime_error_type: "timeout"`
+- a stderr message explaining the timeout
 
 ## Proxy handling
 

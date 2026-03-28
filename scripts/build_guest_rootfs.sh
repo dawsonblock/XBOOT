@@ -46,8 +46,8 @@ if [[ -n "$ROOTFS_TEMPLATE" ]]; then
   cp -a "$ROOTFS_TEMPLATE"/. "$STAGING_DIR"/
 fi
 
-cp "$ROOT/guest/worker.py" "$STAGING_DIR/zeroboot/worker.py"
-cp "$ROOT/guest/worker_node.js" "$STAGING_DIR/zeroboot/worker_node.js"
+cp "$ROOT"/guest/*.py "$STAGING_DIR/zeroboot/"
+cp "$ROOT"/guest/*.js "$STAGING_DIR/zeroboot/"
 
 if command -v gcc >/dev/null 2>&1; then
   gcc -Os -static -s -o "$STAGING_DIR/init" "$ROOT/guest/init.c"
@@ -59,6 +59,7 @@ if [[ -x "$STAGING_DIR/init" ]]; then
   chmod +x "$STAGING_DIR/init"
 fi
 chmod 0644 "$STAGING_DIR/zeroboot/worker.py" "$STAGING_DIR/zeroboot/worker_node.js"
+chmod 0644 "$STAGING_DIR"/zeroboot/*.py "$STAGING_DIR"/zeroboot/*.js
 
 if [[ -n "$OUT_MANIFEST" ]]; then
   {
@@ -66,8 +67,8 @@ if [[ -n "$OUT_MANIFEST" ]]; then
     echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "staging_dir=$STAGING_DIR"
     if [[ -f "$STAGING_DIR/init" ]]; then sha256sum "$STAGING_DIR/init" | awk '{print "init_sha256=" $1}'; fi
-    sha256sum "$STAGING_DIR/zeroboot/worker.py" | awk '{print "worker_py_sha256=" $1}'
-    sha256sum "$STAGING_DIR/zeroboot/worker_node.js" | awk '{print "worker_node_sha256=" $1}'
+    sha256sum "$STAGING_DIR/zeroboot/worker_supervisor.py" | awk '{print "worker_py_sha256=" $1}'
+    sha256sum "$STAGING_DIR/zeroboot/worker_supervisor.js" | awk '{print "worker_node_sha256=" $1}'
     find "$STAGING_DIR" -type f -printf '%P
 ' | sort | while read -r rel; do
       sha256sum "$STAGING_DIR/$rel" | awk -v rel="$rel" '{print "file=" rel " sha256=" $1}'
