@@ -5,7 +5,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
-use crate::{protocol, template_manifest};
+use crate::{protocol, startup, template_manifest};
 use std::time::{Duration, Instant};
 
 const FC_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -100,15 +100,21 @@ impl FirecrackerVm {
         let snapshot_dir = format!("{}/snapshot", work_dir);
         let _ = std::fs::remove_file(&socket_path);
         std::fs::create_dir_all(&snapshot_dir)?;
+        let firecracker_bin = startup::resolved_firecracker_binary()?;
 
         eprintln!("Starting Firecracker...");
-        let process = Command::new("firecracker")
+        let process = Command::new(&firecracker_bin)
             .args(["--api-sock", &socket_path])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("Failed to start Firecracker")?;
+            .with_context(|| {
+                format!(
+                    "Failed to start Firecracker via {}",
+                    firecracker_bin.display()
+                )
+            })?;
 
         let start = Instant::now();
         while !Path::new(&socket_path).exists() {
@@ -398,7 +404,8 @@ pub fn create_template_snapshot(
         // Build provenance
         built_from_git_rev: std::env::var("ZEROBOOT_GIT_REV").ok(),
         build_host: std::env::var("ZEROBOOT_BUILD_HOST").ok(),
-        firecracker_binary_sha256: std::env::var("ZEROBOOT_FC_BINARY_SHA256").ok(),
+        firecracker_binary_sha256: firecracker_binary_sha256()
+            .or_else(|| std::env::var("ZEROBOOT_FC_BINARY_SHA256").ok()),
 
         // Original fields
         language: Some(infer_language_from_rootfs(rootfs_path)),
@@ -435,7 +442,8 @@ fn infer_language_from_rootfs(rootfs_path: &str) -> String {
 }
 
 fn firecracker_version() -> Option<String> {
-    let output = Command::new("firecracker").arg("--version").output().ok()?;
+    let binary = startup::resolved_firecracker_binary().ok()?;
+    let output = Command::new(binary).arg("--version").output().ok()?;
     let text = if output.stdout.is_empty() {
         String::from_utf8_lossy(&output.stderr).trim().to_string()
     } else {
@@ -446,6 +454,11 @@ fn firecracker_version() -> Option<String> {
     } else {
         Some(text)
     }
+}
+
+fn firecracker_binary_sha256() -> Option<String> {
+    let binary = startup::resolved_firecracker_binary().ok()?;
+    template_manifest::sha256_hex(&binary).ok()
 }
 
 fn current_unix_ms() -> u64 {

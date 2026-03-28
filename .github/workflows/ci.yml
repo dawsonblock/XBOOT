@@ -135,9 +135,23 @@ jobs:
           ./target/release/zeroboot test-exec /tmp/zb-release/templates/node node "console.log(1+1)"
       - name: Start API and smoke HTTP surface
         run: |
+          set -euo pipefail
           ./target/release/zeroboot serve "python:/tmp/zb-release/templates/python,node:/tmp/zb-release/templates/node" 8080 > /tmp/zeroboot.log 2>&1 &
           echo $! > /tmp/zeroboot.pid
-          sleep 3
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/ready >/dev/null; then
+              break
+            fi
+            if ! kill -0 "$(cat /tmp/zeroboot.pid)" 2>/dev/null; then
+              cat /tmp/zeroboot.log
+              exit 1
+            fi
+            if [[ "$attempt" -eq 30 ]]; then
+              cat /tmp/zeroboot.log
+              exit 1
+            fi
+            sleep 1
+          done
           curl -fsS http://127.0.0.1:8080/live
           curl -fsS http://127.0.0.1:8080/ready
           curl -fsS http://127.0.0.1:8080/health

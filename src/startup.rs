@@ -200,9 +200,13 @@ pub fn resolve_firecracker_binary() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("firecracker"))
 }
 
-fn verify_firecracker_binary(config: &ServerConfig) -> Result<()> {
+pub fn resolved_firecracker_binary() -> Result<PathBuf> {
     let binary = resolve_firecracker_binary();
-    let resolved_binary = resolve_executable(&binary)?;
+    resolve_executable(&binary)
+}
+
+fn verify_firecracker_binary(config: &ServerConfig) -> Result<()> {
+    let resolved_binary = resolved_firecracker_binary()?;
     let version_output = Command::new(&resolved_binary)
         .arg("--version")
         .output()
