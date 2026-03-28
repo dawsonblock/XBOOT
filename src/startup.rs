@@ -151,11 +151,9 @@ fn verify_auth_and_logging_paths(config: &ServerConfig) -> Result<()> {
     }
 
     if config.artifacts.require_template_signatures {
-        let keyring_path = config
-            .artifacts
-            .keyring_path
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("signature verification requires ZEROBOOT_KEYRING_PATH"))?;
+        let keyring_path = config.artifacts.keyring_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("signature verification requires ZEROBOOT_KEYRING_PATH")
+        })?;
         verify_readable_file(keyring_path, "keyring file")?;
     }
 

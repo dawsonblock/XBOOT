@@ -328,7 +328,11 @@ pub fn sign_manifest_with_required_fields(
     key_pair_bytes: &[u8],
     manifest_json: &str,
 ) -> Result<(String, String)> {
-    sign_manifest(key_pair_bytes, manifest_json, REQUIRED_MANIFEST_SIGNED_FIELDS)
+    sign_manifest(
+        key_pair_bytes,
+        manifest_json,
+        REQUIRED_MANIFEST_SIGNED_FIELDS,
+    )
 }
 
 /// Get the public key ID from a key pair (SHA256 hash of public key)

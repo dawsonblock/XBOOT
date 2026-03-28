@@ -344,10 +344,9 @@ pub fn verify_template_artifacts_with_policy(
                 anyhow::anyhow!("template has signature but missing signer_key_id")
             })?;
             let signature = manifest.manifest_signature.as_ref().unwrap();
-            let signed_fields = manifest
-                .manifest_signed_fields
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("template has signature but missing manifest_signed_fields"))?;
+            let signed_fields = manifest.manifest_signed_fields.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("template has signature but missing manifest_signed_fields")
+            })?;
             signing::validate_manifest_signed_fields(signed_fields)?;
 
             // Serialize manifest to JSON for verification
@@ -900,7 +899,11 @@ mod signature_enforcement_tests {
         let keyring = create_signed_manifest(tmp.path(), "prod", true).unwrap();
         let result =
             verify_template_artifacts_with_policy(tmp.path(), &prod_policy(keyring.as_deref()));
-        assert!(result.is_ok(), "expected signed prod template to pass: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "expected signed prod template to pass: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -911,7 +914,11 @@ mod signature_enforcement_tests {
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         manifest["mem_size_mib"] = serde_json::json!(1024);
-        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
 
         let result =
             verify_template_artifacts_with_policy(tmp.path(), &prod_policy(keyring.as_deref()));

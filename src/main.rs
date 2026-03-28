@@ -24,12 +24,12 @@ use api::handlers::{
 use config::{AuthMode, ServerConfig};
 use protocol::GuestRequest;
 use template_manifest::ManifestPolicy;
-use vmm::firecracker;
-use vmm::kvm::{ForkedVm, VmSnapshot};
 #[cfg(target_os = "linux")]
 use template_manifest::VerificationMode;
+use vmm::firecracker;
 #[cfg(target_os = "linux")]
 use vmm::kvm::create_snapshot_memfd;
+use vmm::kvm::{ForkedVm, VmSnapshot};
 #[cfg(target_os = "linux")]
 use vmm::vmstate;
 
@@ -819,10 +819,15 @@ fn cmd_promote_template(args: &[String]) -> Result<()> {
 
     let mut policy = ManifestPolicy::dev();
     policy.require_hashes = true;
-    let existing_manifest =
-        template_manifest::verify_template_artifacts_with_policy(workdir, &policy).with_context(
-            || format!("pre-promotion verification failed for {}", manifest_path.display()),
-        )?;
+    let existing_manifest = template_manifest::verify_template_artifacts_with_policy(
+        workdir, &policy,
+    )
+    .with_context(|| {
+        format!(
+            "pre-promotion verification failed for {}",
+            manifest_path.display()
+        )
+    })?;
     if existing_manifest.schema_version != Some(1) {
         bail!(
             "promote-template only supports schema_version=1, got {:?}",
@@ -871,18 +876,13 @@ fn cmd_promote_template(args: &[String]) -> Result<()> {
         }])),
     )?;
 
-    let out_path = out_path
-        .as_deref()
-        .map(Path::new)
-        .unwrap_or(manifest_path);
+    let out_path = out_path.as_deref().map(Path::new).unwrap_or(manifest_path);
     write_bytes_atomic(out_path, final_json.as_bytes())?;
 
     let signature_sha256 = {
-        let signature_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &signature,
-        )
-        .context("generated signature was not valid base64")?;
+        let signature_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &signature)
+                .context("generated signature was not valid base64")?;
         hex::encode(Sha256::digest(signature_bytes))
     };
     let receipt = PromotionReceipt {
