@@ -1,0 +1,16 @@
+target/
+workdir*/
+*.pyc
+__pycache__/
+.pytest_cache/
+.venv/
+.agents_tmp/
+dist/
+.cargo-home/
+.cargo-target/
+.env
+*.ext4
+*.sha256
+*.img
+*.log
+/var/lib/zeroboot/

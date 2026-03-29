@@ -1,0 +1,229 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  sanity:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+      - name: python syntax
+        run: python -m py_compile guest/worker.py guest/worker_supervisor.py guest/worker_child.py sdk/python/zeroboot/client.py scripts/make_api_keys.py scripts/create_release_receipt.py
+      - name: node syntax
+        run: node --check guest/worker_node.js && node --check guest/worker_supervisor.js && node --check guest/worker_child.js
+      - name: shell syntax
+        run: bash -n verify.sh deploy/deploy.sh scripts/build_guest_rootfs.sh scripts/build_rootfs_image.sh scripts/preflight.sh scripts/create_release_bundle.sh scripts/fetch_official_artifacts.sh scripts/install_node_runtime.sh scripts/prepare_rootfs_template.sh
+      - name: unit tests
+        run: python -m pytest -q
+      - name: release bundle
+        run: |
+          bash scripts/create_release_bundle.sh /tmp/zeroboot-source.tar.gz
+          tar -tzf /tmp/zeroboot-source.tar.gz | (! grep -E '(^|/)(target|__MACOSX|.agents_tmp)(/|$)')
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --locked -- -D warnings -A dead_code -A unused_variables -A unused_imports -A clippy::empty_line_after_doc_comments
+      - name: cargo tests
+        run: cargo test --locked
+
+  # Verify template manifests before merge - ensures only properly formed templates are accepted
+  artifact-verify:
+    runs-on: ubuntu-latest
+    needs: sanity
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find template manifests
+        run: find . -name 'template.manifest.json' -type f | sort
+      - name: Validate manifest schema
+        run: |
+          mapfile -t manifests < <(find . -name 'template.manifest.json' -type f | sort)
+          if [ "${#manifests[@]}" -eq 0 ]; then
+            echo "No checked-in template manifests to validate"
+            exit 0
+          fi
+          for manifest in "${manifests[@]}"; do
+            echo "Validating $manifest..."
+            python3 - "$manifest" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          manifest = pathlib.Path(sys.argv[1])
+          data = json.loads(manifest.read_text())
+          required = ["schema_version", "template_id", "promotion_channel", "language"]
+          for field in required:
+              if field not in data:
+                  raise SystemExit(f"ERROR: {manifest} missing required field: {field}")
+          if data.get("promotion_channel") == "prod" and not data.get("manifest_signature"):
+              raise SystemExit(f"ERROR: prod template {manifest} missing signature")
+          print(f"OK: {manifest}")
+          PY
+          done
+
+  kvm-integration:
+    runs-on: [self-hosted, linux, x64, kvm, ubuntu-22.04]
+    needs: sanity
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build zeroboot
+        run: cargo build --locked --release
+      - name: Fetch pinned artifacts
+        run: |
+          bash scripts/fetch_official_artifacts.sh /tmp/zb-artifacts
+          echo "/tmp/zb-artifacts/firecracker/release-v1.12.0-x86_64" >> "$GITHUB_PATH"
+      - name: Verify Firecracker exists
+        run: |
+          command -v firecracker
+          firecracker --version
+      - name: Assemble promoted release
+        run: |
+          set -euo pipefail
+          bash scripts/prepare_rootfs_template.sh /tmp/zb-artifacts/rootfs/ubuntu-22.04.ext4 /tmp/zb-rootfs-base
+          cp -a /tmp/zb-rootfs-base /tmp/zb-rootfs-python-template
+          cp -a /tmp/zb-rootfs-base /tmp/zb-rootfs-node-template
+          bash scripts/install_node_runtime.sh /tmp/zb-rootfs-node-template /tmp/zb-artifacts
+          bash scripts/build_guest_rootfs.sh python /tmp/zb-staging-python --rootfs-template /tmp/zb-rootfs-python-template
+          bash scripts/build_rootfs_image.sh /tmp/zb-staging-python /tmp/rootfs-python.ext4
+          bash scripts/build_guest_rootfs.sh node /tmp/zb-staging-node --rootfs-template /tmp/zb-rootfs-node-template
+          bash scripts/build_rootfs_image.sh /tmp/zb-staging-node /tmp/rootfs-node.ext4
+          mkdir -p /tmp/zb-release/bin /tmp/zb-release/templates/python /tmp/zb-release/templates/node
+          cp ./target/release/zeroboot /tmp/zb-release/bin/zeroboot
+          ./target/release/zeroboot template /tmp/zb-artifacts/kernel/vmlinux-5.10.223 /tmp/rootfs-python.ext4 /tmp/zb-release/templates/python 20 /init 512
+          ./target/release/zeroboot template /tmp/zb-artifacts/kernel/vmlinux-5.10.223 /tmp/rootfs-node.ext4 /tmp/zb-release/templates/node 20 /init 512
+          ./target/release/zeroboot keygen /tmp/zb-signing-key.pkcs8 > /tmp/zb-keygen.txt
+          KEY_ID="$(awk '/^Key ID:/ {print $3; exit}' /tmp/zb-keygen.txt)"
+          PUBLIC_KEY="$(awk '/^Public Key \\(base64\\):/{getline; gsub(/^  /,\"\"); print; exit}' /tmp/zb-keygen.txt)"
+          cat > /tmp/zb-keyring.json <<EOF
+          {
+            "keys": [
+              {
+                "key_id": "$KEY_ID",
+                "algorithm": "ed25519",
+                "public_key": "$PUBLIC_KEY",
+                "enabled": true,
+                "description": "ci signer"
+              }
+            ]
+          }
+          EOF
+          ./target/release/zeroboot promote-template /tmp/zb-release/templates/python/template.manifest.json --channel prod --key /tmp/zb-signing-key.pkcs8 --key-id "$KEY_ID" --receipt /tmp/zb-release/templates/python/promotion-receipt.json
+          ./target/release/zeroboot promote-template /tmp/zb-release/templates/node/template.manifest.json --channel prod --key /tmp/zb-signing-key.pkcs8 --key-id "$KEY_ID" --receipt /tmp/zb-release/templates/node/promotion-receipt.json
+          python3 scripts/create_release_receipt.py /tmp/zb-release kvm-release
+          printf 'ci-pepper\n' > /tmp/zb-pepper.txt
+          python3 scripts/make_api_keys.py --count 1 --pepper-file /tmp/zb-pepper.txt --output /tmp/zb-api-keys.json > /tmp/zb-api-keygen.txt
+          SMOKE_TOKEN="$(awk '/^zb_live_/{print; exit}' /tmp/zb-api-keygen.txt)"
+          FC_SHA="$(sha256sum /tmp/zb-artifacts/firecracker/release-v1.12.0-x86_64/firecracker-v1.12.0-x86_64 | awk '{print $1}')"
+          FC_VERSION="$(firecracker --version 2>&1)"
+          {
+            echo "ZEROBOOT_AUTH_MODE=prod"
+            echo "ZEROBOOT_API_KEYS_FILE=/tmp/zb-api-keys.json"
+            echo "ZEROBOOT_API_KEY_PEPPER_FILE=/tmp/zb-pepper.txt"
+            echo "ZEROBOOT_REQUIRE_TEMPLATE_HASHES=true"
+            echo "ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=true"
+            echo "ZEROBOOT_KEYRING_PATH=/tmp/zb-keyring.json"
+            echo "ZEROBOOT_ALLOWED_FIRECRACKER_VERSION=$FC_VERSION"
+            echo "ZEROBOOT_ALLOWED_FC_BINARY_SHA256=$FC_SHA"
+            echo "ZEROBOOT_RELEASE_CHANNEL=prod"
+            echo "ZEROBOOT_FIRECRACKER_BIN=/tmp/zb-artifacts/firecracker/release-v1.12.0-x86_64/firecracker-v1.12.0-x86_64"
+            echo "SMOKE_TOKEN=$SMOKE_TOKEN"
+          } >> "$GITHUB_ENV"
+      - name: Verify startup against promoted release
+        run: |
+          ./target/release/zeroboot verify-startup "python:/tmp/zb-release/templates/python,node:/tmp/zb-release/templates/node" --release-root /tmp/zb-release
+      - name: Smoke exec Python and Node
+        run: |
+          ./target/release/zeroboot test-exec /tmp/zb-release/templates/python python "print(1+1)"
+          ./target/release/zeroboot test-exec /tmp/zb-release/templates/node node "console.log(1+1)"
+      - name: Start API and smoke HTTP surface
+        run: |
+          set -euo pipefail
+          ./target/release/zeroboot serve "python:/tmp/zb-release/templates/python,node:/tmp/zb-release/templates/node" 8080 > /tmp/zeroboot.log 2>&1 &
+          echo $! > /tmp/zeroboot.pid
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/ready >/dev/null 2>&1; then
+              break
+            fi
+            if ! kill -0 "$(cat /tmp/zeroboot.pid)" 2>/dev/null; then
+              cat /tmp/zeroboot.log
+              exit 1
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat /tmp/zeroboot.log
+              exit 1
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/live
+          curl -fsS http://127.0.0.1:8080/ready
+          curl -fsS http://127.0.0.1:8080/health
+          curl -fsS -X POST http://127.0.0.1:8080/v1/exec \
+            -H 'content-type: application/json' \
+            -H "authorization: Bearer $SMOKE_TOKEN" \
+            -d '{"language":"python","code":"print(40+2)","timeout_seconds":5}'
+          curl -fsS -X POST http://127.0.0.1:8080/v1/exec \
+            -H 'content-type: application/json' \
+            -H "authorization: Bearer $SMOKE_TOKEN" \
+            -d '{"language":"node","code":"console.log(40+2)","timeout_seconds":5}'
+      - name: Release layout smoke with current and deploy-state
+        run: |
+          set -euo pipefail
+          DEPLOY_ROOT=/tmp/zb-deploy-root
+          rm -rf "$DEPLOY_ROOT"
+          mkdir -p "$DEPLOY_ROOT/releases"
+          cp -a /tmp/zb-release "$DEPLOY_ROOT/releases/release-a"
+          cp -a /tmp/zb-release "$DEPLOY_ROOT/releases/release-b"
+          python3 scripts/create_release_receipt.py "$DEPLOY_ROOT/releases/release-a" release-a >/dev/null
+          python3 scripts/create_release_receipt.py "$DEPLOY_ROOT/releases/release-b" release-b >/dev/null
+          ln -sfn "$DEPLOY_ROOT/releases/release-a" "$DEPLOY_ROOT/current"
+          python3 - <<'PY'
+          import json, pathlib, time
+          state = {
+              "current_release": "release-a",
+              "previous_release": None,
+              "updated_at_unix_ms": int(time.time() * 1000),
+          }
+          pathlib.Path("/tmp/zb-deploy-root/deploy-state.json").write_text(json.dumps(state, indent=2) + "\n")
+          PY
+          ./target/release/zeroboot verify-startup "python:$DEPLOY_ROOT/current/templates/python,node:$DEPLOY_ROOT/current/templates/node" --release-root "$DEPLOY_ROOT/current"
+          ln -sfn "$DEPLOY_ROOT/releases/release-b" "$DEPLOY_ROOT/current"
+          python3 - <<'PY'
+          import json, pathlib, time
+          state = {
+              "current_release": "release-b",
+              "previous_release": "release-a",
+              "updated_at_unix_ms": int(time.time() * 1000),
+          }
+          pathlib.Path("/tmp/zb-deploy-root/deploy-state.json").write_text(json.dumps(state, indent=2) + "\n")
+          PY
+          ./target/release/zeroboot verify-startup "python:$DEPLOY_ROOT/current/templates/python,node:$DEPLOY_ROOT/current/templates/node" --release-root "$DEPLOY_ROOT/current"
+          PREVIOUS_RELEASE="$(python3 - <<'PY'
+          import json, pathlib
+          state = json.loads(pathlib.Path("/tmp/zb-deploy-root/deploy-state.json").read_text())
+          print(state["previous_release"])
+          PY
+          )"
+          ln -sfn "$DEPLOY_ROOT/releases/$PREVIOUS_RELEASE" "$DEPLOY_ROOT/current"
+          ./target/release/zeroboot verify-startup "python:$DEPLOY_ROOT/current/templates/python,node:$DEPLOY_ROOT/current/templates/node" --release-root "$DEPLOY_ROOT/current"
+      - name: Stop API
+        if: always()
+        run: |
+          kill "$(cat /tmp/zeroboot.pid)" || true

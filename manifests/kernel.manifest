@@ -1,0 +1,7 @@
+# Fill these values before building templates from source.
+# The build scripts refuse to proceed when required values remain unset.
+firecracker_version=1.12.0
+kernel_version=5.10.223
+kernel_sha256=22847375721aceea63d934c28f2dfce4670b6f52ec904fae19f5145a970c1e65
+kernel_path=guest/vmlinux-fc
+arch=x86_64

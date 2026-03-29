@@ -1,0 +1,9 @@
+# Runtime manifest for the Python guest image.
+language=python
+base_rootfs=http://spec.ccfc.min.s3.amazonaws.com/firecracker-ci/v1.10/x86_64/ubuntu-22.04.ext4
+base_rootfs_sha256=040927105bd01b19e7b02cd5da5a9552b428a7f84bd5ffc22ebfce4ddf258a07
+packages=busybox,python3
+entrypoint=/init
+worker=/zeroboot/worker_supervisor.py
+runtime_binary=/usr/bin/python3
+runtime_version=3.10.12

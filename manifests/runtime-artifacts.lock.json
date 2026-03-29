@@ -1,0 +1,36 @@
+{
+  "host_matrix": {
+    "host_os": "Ubuntu 22.04 x86_64",
+    "virtualization": "KVM",
+    "init_system": "systemd",
+    "guest_networking": "offline-only"
+  },
+  "firecracker": {
+    "version": "1.12.0",
+    "release_tgz_url": "https://github.com/firecracker-microvm/firecracker/releases/download/v1.12.0/firecracker-v1.12.0-x86_64.tgz",
+    "release_tgz_sha256": "392b5f7e4bf12871d1e8377a60ed3b384a46bc2f7d3771caf202aa7a63e32676",
+    "binary_sha256": "6ba205fa2f1ccad95848515deaee59e7750d38b7a0a49c5c805cd3097ab9f368"
+  },
+  "kernel": {
+    "version": "5.10.223",
+    "url": "http://spec.ccfc.min.s3.amazonaws.com/firecracker-ci/v1.10/x86_64/vmlinux-5.10.223",
+    "sha256": "22847375721aceea63d934c28f2dfce4670b6f52ec904fae19f5145a970c1e65"
+  },
+  "base_rootfs": {
+    "distro": "Ubuntu 22.04",
+    "url": "http://spec.ccfc.min.s3.amazonaws.com/firecracker-ci/v1.10/x86_64/ubuntu-22.04.ext4",
+    "sha256": "040927105bd01b19e7b02cd5da5a9552b428a7f84bd5ffc22ebfce4ddf258a07",
+    "upstream_manifest_url": "http://spec.ccfc.min.s3.amazonaws.com/firecracker-ci/v1.10/x86_64/ubuntu-22.04.manifest"
+  },
+  "python_runtime": {
+    "binary": "/usr/bin/python3",
+    "version": "3.10.12",
+    "source": "included in the Ubuntu 22.04 base rootfs"
+  },
+  "node_runtime": {
+    "binary": "/usr/bin/node",
+    "version": "20.20.2",
+    "tarball_url": "https://nodejs.org/dist/v20.20.2/node-v20.20.2-linux-x64.tar.xz",
+    "tarball_sha256": "df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d"
+  }
+}
