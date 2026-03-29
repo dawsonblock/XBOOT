@@ -36,6 +36,22 @@ XBOOT is a VM sandbox runtime for **controlled internal use** on **Ubuntu 22.04 
 
 Current status: a strong internal sandbox base with real trust controls, but KVM end-to-end proof on the pinned host matrix remains a release gate.
 
+### Deployment Assets
+
+This repository includes complete deployment infrastructure:
+
+| Asset | Path | Purpose |
+|-------|------|---------|
+| **Docker Setup** | `scripts/setup-docker.sh` | One-command Docker deployment |
+| **Docker Compose** | `deploy/docker/docker-compose.yml` | Container orchestration |
+| **Dockerfile** | `deploy/docker/Dockerfile.runtime` | Runtime container image |
+| **K8s Manifests** | `deploy/k8s/*.yaml` | Kubernetes deployment (9 files) |
+| **Smoke Tests** | `scripts/smoke_exec.sh` | Basic health/exec verification |
+| **Soak Tests** | `scripts/repeat_smoke.sh` | Protocol drift detection |
+| **Host Check** | `scripts/check_kvm_host.sh` | KVM readiness validation |
+
+All assets are validated and ready to use. See [Quick Start (Docker)](#quick-start-docker---recommended) below.
+
 ### Production Mode Requirements
 
 In **Prod mode**, the server enforces strict security requirements:
