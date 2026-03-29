@@ -55,7 +55,7 @@ echo -n "Testing Python exec... "
 python_response=$(curl -fsS -X POST "$BASE_URL/v1/exec" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $API_KEY" \
-    -d '{"language": "python", "code": "print(2+2)", "timeout_secs": 30}' \
+    -d '{"language": "python", "code": "print(2+2)", "timeout_seconds": 30}' \
     2>/dev/null || true)
 
 if [[ -n "$python_response" ]]; then
@@ -81,7 +81,7 @@ echo -n "Testing Node.js exec... "
 node_response=$(curl -fsS -X POST "$BASE_URL/v1/exec" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $API_KEY" \
-    -d '{"language": "node", "code": "console.log(2+2)", "timeout_secs": 30}' \
+    -d '{"language": "node", "code": "console.log(2+2)", "timeout_seconds": 30}' \
     2>/dev/null || true)
 
 if [[ -n "$node_response" ]]; then

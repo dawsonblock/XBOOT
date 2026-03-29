@@ -211,11 +211,11 @@ fn load_snapshot(
     let manifest = template_manifest::verify_template_artifacts_with_policy(workdir_path, &policy)?;
 
     eprintln!("Loading template for macOS HVF from {}...", workdir);
-    
+
     // Resolve paths from manifest
     let kernel_path = template_manifest::resolve_path(workdir_path, &manifest.kernel_path);
     let rootfs_path = template_manifest::resolve_path(workdir_path, &manifest.rootfs_path);
-    
+
     // Get memory size from manifest or default
     let mem_size = (manifest.mem_size_mib as usize) * 1024 * 1024;
     eprintln!("  Memory: {} MiB", manifest.mem_size_mib);
@@ -230,7 +230,7 @@ fn load_snapshot(
         rootfs_path: Some(rootfs_path.to_string_lossy().to_string()),
         init_path: Some(manifest.init_path.clone()),
     };
-    
+
     Ok((snapshot, -1))
 }
 

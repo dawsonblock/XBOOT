@@ -1,6 +1,6 @@
 // macOS Hypervisor.framework VMM implementation
 // Provides a KVM-compatible interface using Apple's Hypervisor.framework
-// 
+//
 // NOTE: This is a stub implementation for Apple Silicon (ARM64).
 // The actual Hypervisor.framework API on ARM64 is different from x86_64
 // and requires additional research and proper FFI bindings.
@@ -9,8 +9,8 @@
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{find_response_frame, GuestResponse};
 use super::serial::Serial;
+use crate::protocol::{find_response_frame, GuestResponse};
 
 /// VM configuration for macOS
 /// Note: On macOS, this represents a fresh boot configuration,
@@ -51,7 +51,7 @@ impl ForkedVm {
     /// restoring from a snapshot (since HVF doesn't support snapshot/restore)
     pub fn fork_cow(snapshot: &VmSnapshot, _memfd: i32) -> Result<Self> {
         let start = Instant::now();
-        
+
         // STUB: Hypervisor.framework on ARM64 requires proper FFI bindings
         // For now, we return an error directing users to use the Firecracker/QEMU path
         bail!(
@@ -63,14 +63,14 @@ impl ForkedVm {
                 qemu-system-aarch64 -accel hvf -m 512 -kernel kernel -drive file=rootfs.ext4"
         )
     }
-    
+
     /// Send data to guest via serial port
     pub fn send_serial(&mut self, data: &[u8]) -> Result<()> {
         self.serial.queue_input(data);
         self.serial.set_ier_data_ready(true);
         Ok(())
     }
-    
+
     /// Run vCPU until response or timeout
     pub fn run_until_response_timeout(
         &mut self,

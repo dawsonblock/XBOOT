@@ -71,7 +71,7 @@ run_single_test() {
             response=$(curl -fsS -X POST "$BASE_URL/v1/exec" \
                 -H "Content-Type: application/json" \
                 -H "Authorization: Bearer $API_KEY" \
-                -d "{\"language\": \"python\", \"code\": \"print($iter + $iter)\", \"timeout_secs\": 30}" \
+                -d "{\"language\": \"python\", \"code\": \"print($iter + $iter)\", \"timeout_seconds\": 30}" \
                 2>/dev/null || true)
             if [[ -n "$response" ]]; then
                 stdout=$(echo "$response" | jq -r '.stdout // empty')
@@ -88,7 +88,7 @@ run_single_test() {
             response=$(curl -fsS -X POST "$BASE_URL/v1/exec" \
                 -H "Content-Type: application/json" \
                 -H "Authorization: Bearer $API_KEY" \
-                -d "{\"language\": \"node\", \"code\": \"console.log($iter + $iter)\", \"timeout_secs\": 30}" \
+                -d "{\"language\": \"node\", \"code\": \"console.log($iter + $iter)\", \"timeout_seconds\": 30}" \
                 2>/dev/null || true)
             if [[ -n "$response" ]]; then
                 stdout=$(echo "$response" | jq -r '.stdout // empty')
@@ -137,7 +137,7 @@ for i in $(seq 1 $ITERATIONS); do
         py_response=$(curl -fsS -X POST "$BASE_URL/v1/exec" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $API_KEY" \
-            -d "{\"language\": \"python\", \"code\": \"print($i)\", \"timeout_secs\": 30}" \
+            -d "{\"language\": \"python\", \"code\": \"print($i)\", \"timeout_seconds\": 30}" \
             2>/dev/null || true)
         if [[ -n "$py_response" ]]; then
             py_stdout=$(echo "$py_response" | jq -r '.stdout // empty')
@@ -155,7 +155,7 @@ for i in $(seq 1 $ITERATIONS); do
         node_response=$(curl -fsS -X POST "$BASE_URL/v1/exec" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $API_KEY" \
-            -d "{\"language\": \"node\", \"code\": \"console.log($i)\", \"timeout_secs\": 30}" \
+            -d "{\"language\": \"node\", \"code\": \"console.log($i)\", \"timeout_seconds\": 30}" \
             2>/dev/null || true)
         if [[ -n "$node_response" ]]; then
             node_stdout=$(echo "$node_response" | jq -r '.stdout // empty')
