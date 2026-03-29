@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 /// API key record stored on server - contains hash, not the actual key
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,9 +78,11 @@ impl ApiKeyVerifier {
         let result = mac.finalize();
         let computed_hash = hex::encode(result);
 
-        // HMAC-SHA256 provides the security here; the hash comparison itself
-        // is safe because the hash output is high-entropy and unpredictable
-        if computed_hash == record.hash {
+        // HMAC-SHA256 provides the security here; we use constant-time comparison
+        // to prevent timing side-channels even though HMAC output is high-entropy
+        let computed_bytes = computed_hash.as_bytes();
+        let stored_bytes = record.hash.as_bytes();
+        if computed_bytes.ct_eq(stored_bytes).into() {
             Ok(record.clone())
         } else {
             bail!("invalid key");

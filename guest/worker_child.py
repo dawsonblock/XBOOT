@@ -1,89 +1,45 @@
 #!/usr/bin/env python3
-import builtins
-import contextlib
+"""Worker child process - thin orchestration wrapper.
+
+This is a minimal wrapper that:
+1. Parses input from supervisor
+2. Applies resource limits
+3. Executes user code with timeout handling
+4. Returns framed response
+5. Exits cleanly (cleanup before response, no cleanup after)
+"""
+
 import gc
-import io
 import json
 import os
 import shutil
 import signal
 import sys
 import tempfile
-import traceback
+from typing import Tuple, Optional
 
-try:
-    import resource
-except ImportError:  # pragma: no cover
-    resource = None
+from executor import execute_code
+from limits import apply_limits, limit_profile
+from protocol import encode_response, decode_payload
+
 
 FLAG_STDOUT_TRUNCATED = 1
 FLAG_STDERR_TRUNCATED = 2
 TRUNCATION_MARKER = b"\n[truncated]\n"
 
-
-def limit_profile() -> str:
-    return os.environ.get("ZEROBOOT_CHILD_LIMIT_PROFILE", "guest").strip().lower() or "guest"
-
-
-def truncate_with_marker(data: bytes, limit: int):
-    if len(data) <= limit:
-        return data, False
-    if limit <= len(TRUNCATION_MARKER):
-        return TRUNCATION_MARKER[:limit], True
-    return data[: limit - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER, True
-
-
-def write_response(request_id: bytes, exit_code: int, error_type: str, stdout: bytes, stderr: bytes, flags: int) -> None:
-    header = f"WRK1R {len(request_id)} {exit_code} {error_type} {len(stdout)} {len(stderr)} {flags}\n"
-    sys.stdout.buffer.write(header.encode("utf-8"))
-    sys.stdout.buffer.write(request_id)
-    sys.stdout.buffer.write(stdout)
-    sys.stdout.buffer.write(stderr)
-    sys.stdout.buffer.flush()
+# Global flag for timeout detection
+_timed_out = False
 
 
 def timeout_handler(_signum, _frame):
+    """Handle SIGALRM - set flag and raise exception to interrupt execution."""
+    global _timed_out
+    _timed_out = True
     raise TimeoutError("execution timed out")
 
 
-def apply_limits(timeout_ms: int, limits: dict) -> list[str]:
-    if resource is None:
-        return []
-
-    failures: list[str] = []
-    profile = limit_profile()
-
-    def clamp_and_set(kind, desired):
-        soft, hard = resource.getrlimit(kind)
-        if hard == resource.RLIM_INFINITY:
-            target = desired
-        else:
-            target = min(desired, hard)
-        if soft == resource.RLIM_INFINITY:
-            target_soft = target
-        else:
-            target_soft = min(target, soft) if soft < target else target
-        try:
-            resource.setrlimit(kind, (target_soft, target))
-        except (ValueError, OSError) as exc:
-            failures.append(f"{kind}:{exc}")
-
-    cpu_seconds = max(1, int((timeout_ms + 1999) / 1000))
-    memory_bytes = int(limits.get("memory_bytes", 512 * 1024 * 1024))
-    nofile = int(limits.get("nofile", 64))
-    nproc = int(limits.get("nproc", 16))
-    fsize_bytes = int(limits.get("fsize_bytes", 2 * 1024 * 1024))
-    clamp_and_set(resource.RLIMIT_CPU, cpu_seconds)
-    if profile != "compat" and hasattr(resource, "RLIMIT_AS"):
-        clamp_and_set(resource.RLIMIT_AS, memory_bytes)
-    clamp_and_set(resource.RLIMIT_NOFILE, nofile)
-    if profile != "compat" and hasattr(resource, "RLIMIT_NPROC"):
-        clamp_and_set(resource.RLIMIT_NPROC, nproc)
-    clamp_and_set(resource.RLIMIT_FSIZE, fsize_bytes)
-    return failures
-
-
 def directory_size(path: str) -> int:
+    """Calculate total size of directory in bytes."""
     total = 0
     for root, _dirs, files in os.walk(path):
         for filename in files:
@@ -94,90 +50,179 @@ def directory_size(path: str) -> int:
     return total
 
 
-def main():
+def truncate_with_marker(data: bytes, limit: int) -> Tuple[bytes, bool]:
+    """Truncate data with marker if it exceeds limit."""
+    if len(data) <= limit:
+        return data, False
+    if limit <= len(TRUNCATION_MARKER):
+        return TRUNCATION_MARKER[:limit], True
+    return data[: limit - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER, True
+
+
+def main() -> int:
+    """Main entry point.
+    
+    Returns:
+        Exit code (0 for success, 1 for error)
+    """
+    global _timed_out
+    
+    # Default response values for early errors
     request_id = b"error"
-    max_stdout = 64 * 1024
-    max_stderr = 64 * 1024
-    stdout_io = io.StringIO()
-    stderr_io = io.StringIO()
-    old_environ = dict(os.environ)
-    old_stdin = sys.stdin
-    scratch = None
     exit_code = -1
     error_type = "internal"
-
+    stdout_str = ""
+    stderr_str = ""
+    stdout_bytes = b""
+    stderr_bytes = b""
+    flags = 0
+    scratch: Optional[str] = None
+    limit_failures: list[str] = []
+    
     try:
-        payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
-        request_id = str(payload.get("request_id", "error")).encode("utf-8", "replace")
-        timeout_ms = max(1, int(payload.get("timeout_ms", 30000)))
-        code = str(payload.get("code", ""))
-        stdin_data = str(payload.get("stdin", ""))
-        limits = payload.get("limits", {})
-        max_stdout = int(limits.get("stdout_bytes", max_stdout))
-        max_stderr = int(limits.get("stderr_bytes", max_stderr))
+        # Read and parse payload
+        payload = decode_payload(sys.stdin.buffer.read())
+        request_id = payload["request_id"].encode("utf-8", "replace")
+        
+        # Get limits from payload
+        limits = payload["limits"]
+        max_stdout = int(limits.get("stdout_bytes", 64 * 1024))
+        max_stderr = int(limits.get("stderr_bytes", 64 * 1024))
         max_tmp_bytes = int(limits.get("tmp_bytes", 16 * 1024 * 1024))
-
+        
+        # Create scratch directory
+        scratch = tempfile.mkdtemp(prefix="zeroboot-")
+        
+        # Set up minimal environment
+        old_environ = dict(os.environ)
+        os.environ.clear()
+        os.environ.update({
+            "HOME": scratch,
+            "TMPDIR": scratch,
+            "TMP": scratch,
+            "TEMP": scratch,
+            "ZEROBOOT_TMPDIR": scratch,
+            "ZEROBOOT_OFFLINE": "1",
+            "ZEROBOOT_CHILD_LIMIT_PROFILE": limit_profile(),
+        })
+        
+        # Apply resource limits BEFORE setting up timeout
+        timeout_ms = payload["timeout_ms"]
+        cpu_seconds = max(1, int((timeout_ms + 1999) / 1000))
+        limit_failures = apply_limits(
+            cpu_seconds=cpu_seconds,
+            memory_bytes=int(limits.get("memory_bytes", 512 * 1024 * 1024)),
+            nofile=int(limits.get("nofile", 64)),
+            nproc=int(limits.get("nproc", 16)),
+            fsize_bytes=int(limits.get("fsize_bytes", 2 * 1024 * 1024)),
+        )
+        
+        # Set up timeout handler
+        _timed_out = False
         signal.signal(signal.SIGALRM, timeout_handler)
         signal.setitimer(signal.ITIMER_REAL, timeout_ms / 1000.0)
-        limit_failures = apply_limits(timeout_ms, limits)
-
-        scratch = tempfile.mkdtemp(prefix="zeroboot-")
-        os.environ.clear()
-        os.environ.update(
-            {
-                "HOME": scratch,
-                "TMPDIR": scratch,
-                "TMP": scratch,
-                "TEMP": scratch,
-                "ZEROBOOT_TMPDIR": scratch,
-                "ZEROBOOT_OFFLINE": "1",
-                "ZEROBOOT_CHILD_LIMIT_PROFILE": limit_profile(),
-            }
+        
+        try:
+            # Execute user code
+            exec_exit, stdout_str, stderr_str, exception = execute_code(
+                code=payload["code"],
+                stdin_data=payload["stdin"],
+            )
+            
+            # Check for quota violations
+            if directory_size(scratch) > max_tmp_bytes:
+                exit_code = 1
+                error_type = "runtime"
+                stderr_str += "\ntemporary directory quota exceeded\n"
+            elif exception is not None:
+                exit_code = 1
+                error_type = "runtime"
+            else:
+                exit_code = 0
+                error_type = "ok"
+                
+        except TimeoutError:
+            # Timeout occurred during execution
+            exit_code = -1
+            error_type = "timeout"
+            stdout_str = ""
+            stderr_str = "execution timed out\n"
+            
+        finally:
+            # Cancel timer
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        
+        # Add limit warnings only if there were actual failures and execution wasn't clean
+        if limit_failures and error_type != "ok":
+            stderr_str += "\nlimit setup degraded: " + ", ".join(limit_failures) + "\n"
+        
+        # Truncate output
+        stdout_bytes, stdout_trunc = truncate_with_marker(
+            stdout_str.encode("utf-8", "replace"), max_stdout
         )
-        sys.stdin = io.StringIO(stdin_data)
-        globals_dict = {"__name__": "__main__", "__builtins__": builtins}
-        exit_code = 0
-        error_type = "ok"
-        with contextlib.redirect_stdout(stdout_io), contextlib.redirect_stderr(stderr_io):
-            exec(compile(code, "<zeroboot>", "exec"), globals_dict, globals_dict)
-        if limit_failures:
-            stderr_io.write("limit setup degraded: " + ", ".join(limit_failures) + "\n")
-        if directory_size(scratch) > max_tmp_bytes:
-            exit_code = 1
-            error_type = "runtime"
-            stderr_io.write("temporary directory quota exceeded\n")
-    except TimeoutError:
-        exit_code = -1
-        error_type = "timeout"
-        stderr_io.write("execution timed out\n")
-    except BaseException:
-        if error_type == "ok":
-            exit_code = 1
-            error_type = "runtime"
-        traceback.print_exc(file=stderr_io)
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        sys.stdin = old_stdin
+        stderr_bytes, stderr_trunc = truncate_with_marker(
+            stderr_str.encode("utf-8", "replace"), max_stderr
+        )
+        
+        flags = 0
+        if stdout_trunc:
+            flags |= FLAG_STDOUT_TRUNCATED
+        if stderr_trunc:
+            flags |= FLAG_STDERR_TRUNCATED
+        
+        # Cleanup BEFORE writing response (avoid cleanup-induced -9)
         os.environ.clear()
         os.environ.update(old_environ)
         gc.collect()
         if scratch is not None:
             shutil.rmtree(scratch, ignore_errors=True)
-
-    stdout_bytes, stdout_truncated = truncate_with_marker(
-        stdout_io.getvalue().encode("utf-8", "replace"), max_stdout
-    )
-    stderr_bytes, stderr_truncated = truncate_with_marker(
-        stderr_io.getvalue().encode("utf-8", "replace"), max_stderr
-    )
-    flags = 0
-    if stdout_truncated:
-        flags |= FLAG_STDOUT_TRUNCATED
-    if stderr_truncated:
-        flags |= FLAG_STDERR_TRUNCATED
-
-    write_response(request_id, exit_code, error_type, stdout_bytes, stderr_bytes, flags)
+        
+        # Write response
+        response = encode_response(
+            request_id=request_id,
+            exit_code=exit_code,
+            error_type=error_type,
+            stdout=stdout_bytes,
+            stderr=stderr_bytes,
+            flags=flags,
+        )
+        sys.stdout.buffer.write(response)
+        sys.stdout.buffer.flush()
+        
+        # Clean exit - no signals, no cleanup after this point
+        return 0
+        
+    except json.JSONDecodeError as e:
+        # Protocol error - invalid JSON (classified as internal per test expectations)
+        error_msg = f"invalid JSON payload: {e}".encode("utf-8", "replace")
+        response = encode_response(
+            request_id=request_id,
+            exit_code=-1,
+            error_type="internal",
+            stdout=b"",
+            stderr=error_msg,
+            flags=FLAG_STDERR_TRUNCATED if len(error_msg) > 64 * 1024 else 0,
+        )
+        sys.stdout.buffer.write(response)
+        sys.stdout.buffer.flush()
+        return 0
+        
+    except Exception as e:
+        # Internal error
+        error_msg = str(e).encode("utf-8", "replace")
+        response = encode_response(
+            request_id=request_id,
+            exit_code=-1,
+            error_type="internal",
+            stdout=b"",
+            stderr=error_msg,
+            flags=FLAG_STDERR_TRUNCATED if len(error_msg) > 64 * 1024 else 0,
+        )
+        sys.stdout.buffer.write(response)
+        sys.stdout.buffer.flush()
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

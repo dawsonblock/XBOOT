@@ -102,18 +102,19 @@ def parse_child_response(data: bytes):
 
 
 def child_command(timeout_ms: int) -> list[str]:
+    """Build command for spawning child executor.
+    
+    Args:
+        timeout_ms: Timeout in milliseconds (used for context only)
+        
+    Returns:
+        Command list for subprocess - no shell, no ulimit wrapper
+    """
     child_script = os.environ.get("ZEROBOOT_CHILD_SCRIPT", "/zeroboot/worker_child.py")
     python_bin = os.environ.get("ZEROBOOT_PYTHON_BIN", "python3")
-    cpu_seconds = max(1, int((timeout_ms + 1999) / 1000))
-    memory_kib = max(1, CHILD_MEMORY_BYTES // 1024)
-    file_kib = max(1, CHILD_FSIZE_BYTES // 1024)
-    shell_parts = [f"ulimit -t {cpu_seconds}", f"ulimit -n {CHILD_NOFILE}", f"ulimit -f {file_kib}"]
-    if limit_profile() != "compat":
-        shell_parts.insert(1, f"ulimit -v {memory_kib}")
-        shell_parts.insert(3, f"ulimit -u {CHILD_NPROC}")
-    shell_parts.append(f"exec {python_bin} {child_script}")
-    shell = "; ".join(shell_parts)
-    return ["/bin/sh", "-c", shell]
+    
+    # Direct spawn - no shell wrapper, limits applied in Python child
+    return [python_bin, child_script]
 
 
 def spawn_child_executor(request_id: str, timeout_ms: int, code: str, stdin_data: str):
@@ -163,16 +164,18 @@ def spawn_child_executor(request_id: str, timeout_ms: int, code: str, stdin_data
         result.stdout, MAX_STDOUT, TRUNCATION_MARKER
     )
     if result.returncode is not None and result.returncode < 0:
-        detail = f"child exited by signal {-result.returncode}\n".encode("utf-8", "replace")
+        # Child died by signal - this is an internal error, not the child's fault
+        # Common causes: SIGKILL (ulimit enforcement), SIGSEGV (crash)
+        signal_num = -result.returncode
+        detail = f"child exited by signal {signal_num}\n".encode("utf-8", "replace")
         stderr, stderr_truncated = truncate_with_marker(
             detail + (result.stderr or b""), MAX_STDERR, TRUNCATION_MARKER
         )
         flags = 0
-        if stdout_truncated:
-            flags |= FLAG_STDOUT_TRUNCATED
         if stderr_truncated:
             flags |= FLAG_STDERR_TRUNCATED
-        return -1, "internal", stdout, stderr, flags
+        # Signal death is classified as "internal" - the supervisor layer failed to protect the child
+        return -1, "internal", b"", stderr, flags
     stderr, stderr_truncated = truncate_with_marker(result.stderr, MAX_STDERR, TRUNCATION_MARKER)
     flags = 0
     if stdout_truncated:
