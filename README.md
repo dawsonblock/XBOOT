@@ -102,81 +102,77 @@ This is explicit because upstream no longer publishes an Ubuntu 22.04 artifact s
 
 ## Quick Start
 
-> **Important:** This repo is the **runtime** for XBOOT. It does **not** include guest artifacts (kernel, rootfs) by default. You need to provide these or build them.
+### Deployment Options
 
-The pinned first-pass artifact set is recorded in [runtime-artifacts.lock.json](/Users/dawsonblock/Downloads/XBOOT-main-2/manifests/runtime-artifacts.lock.json) and can be fetched with:
+XBOOT supports three deployment phases:
 
-```bash
-bash scripts/fetch_official_artifacts.sh /var/lib/zeroboot/artifacts
-```
+| Phase | Method | Use Case | Prerequisites |
+|-------|--------|----------|---------------|
+| **A** | [Bare Metal/Systemd](./docs/DEPLOYMENT.md) | Production on dedicated hosts | Ubuntu 22.04 + KVM + Firecracker 1.12.0 |
+| **B** | [Docker](./docs/DOCKER.md) | Development, testing, portability | Same as Phase A + Docker |
+| **C** | [Kubernetes](./docs/KUBERNETES.md) | Fleet deployment, orchestration | Same as Phase A + K8s cluster |
 
-### Option A: Code-Only Testing
+**Important**: Phase A (bare metal) must be stable before containerizing. The Docker and Kubernetes phases are packaging layers, not replacements for KVM isolation.
 
-For contributors without KVM access or guest artifacts:
-
-```bash
-# Portable verification path
-python3 -m pytest -q
-cargo test --locked
-
-# Run lints
-cargo fmt --check
-cargo clippy --locked -- -D warnings -A dead_code -A unused_variables -A unused_imports -A clippy::empty_line_after_doc_comments
-```
-
-### Option B: Full System Bring-Up
-
-Prerequisites:
-- **KVM-capable host** with root access (for `/dev/kvm`)
-- **Firecracker binary** pinned to `1.12.0` and exposed via `ZEROBOOT_FIRECRACKER_BIN` or `PATH`
-- **Pinned guest kernel/rootfs artifacts**
-- **Linux loop-mount support** to extract the base Ubuntu 22.04 ext4 rootfs into a template tree
+### Quick Deploy (Bare Metal)
 
 ```bash
-# Fetch the pinned artifacts
+# 1. Check host readiness
+./scripts/check_kvm_host.sh
+
+# 2. Fetch pinned artifacts
 bash scripts/fetch_official_artifacts.sh /var/lib/zeroboot/artifacts
 
-# Extract the pinned Ubuntu base rootfs into a template tree
-bash scripts/prepare_rootfs_template.sh \
-  /var/lib/zeroboot/artifacts/rootfs/ubuntu-22.04.ext4 \
-  /tmp/zb-rootfs-base
-
-# Build the server
+# 3. Build and create templates
 make build
+make guest-python && make image-python && make template-python
+make guest-node && make image-node && make template-node
 
-# Build a Python guest image from the pinned Ubuntu base rootfs
-cp -a /tmp/zb-rootfs-base /tmp/zb-rootfs-python
-make guest-python PY_ROOTFS_TEMPLATE=/tmp/zb-rootfs-python
-make image-python
-make template-python
+# 4. Assemble release tree
+./scripts/build_release_tree.sh
 
-# Build a Node guest image from a copy of that same pinned base rootfs
-cp -a /tmp/zb-rootfs-base /tmp/zb-rootfs-node
-bash scripts/install_node_runtime.sh /tmp/zb-rootfs-node /var/lib/zeroboot/artifacts
-make guest-node NODE_ROOTFS_TEMPLATE=/tmp/zb-rootfs-node
-make image-node
-make template-node
+# 5. Verify startup
+/var/lib/zeroboot/current/bin/zeroboot verify-startup \
+    "python:/var/lib/zeroboot/current/templates/python,node:/var/lib/zeroboot/current/templates/node" \
+    --release-root /var/lib/zeroboot/current
 
-# Run locally
-./target/release/zeroboot serve python:/var/lib/zeroboot/current/templates/python 8080
+# 6. Run smoke tests
+./scripts/smoke_exec.sh <api-key> http://127.0.0.1:8080
+./scripts/repeat_smoke.sh <api-key> http://127.0.0.1:8080 100
 
-# Or with test execution
-./target/release/zeroboot test-exec /path/to/template python "print(1+1)"
+# 7. Install systemd service
+sudo cp deploy/zeroboot.service /etc/systemd/system/
+sudo systemctl enable --now zeroboot
 ```
 
-### Required Environment Variables
+### Docker Quick Start
 
-For production deployments, set these:
+```bash
+# Build and run with Docker Compose
+make docker-compose-up
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `ZEROBOOT_AUTH_MODE` | `dev` or `prod` | `dev` |
-| `ZEROBOOT_API_KEY_PEPPER_FILE` | Path to pepper secret | `/etc/zeroboot/pepper` |
-| `ZEROBOOT_REQUIRE_TEMPLATE_HASHES` | Enforce template hash verification | `false` in dev |
-| `ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES` | Enforce template signatures | `false` in dev |
-| `ZEROBOOT_KEYRING_PATH` | Path to signing keyring | none |
-| `ZEROBOOT_MIN_FREE_BYTES` | Minimum free space before readiness/execution refuse | `536870912` |
-| `ZEROBOOT_MIN_FREE_INODES` | Minimum free inodes before readiness/execution refuse | `10000` |
+# Run smoke tests
+make docker-smoke
+```
+
+See [docs/DOCKER.md](./docs/DOCKER.md) for full Docker deployment guide.
+
+### Kubernetes Quick Start
+
+```bash
+# Label and taint KVM nodes
+kubectl label node <node> sandbox.kvm=true
+kubectl taint node <node> sandbox.kvm=true:NoSchedule
+
+# Deploy with Kustomize
+kubectl apply -k deploy/k8s/
+
+# Port forward and test
+kubectl port-forward -n xboot svc/xboot 8080:8080
+./scripts/smoke_exec.sh <api-key> http://127.0.0.1:8080
+```
+
+See [docs/KUBERNETES.md](./docs/KUBERNETES.md) for full Kubernetes deployment guide.
 
 ---
 
@@ -323,23 +319,50 @@ XBOOT/
 │   │   ├── kvm.rs           # KVM snapshot restore
 │   │   └── vmstate.rs       # VM state parsing
 │   └── api/
-│       └── handlers.rs     # HTTP request handlers
+│       └── handlers.rs      # HTTP request handlers
 ├── guest/
 │   ├── init.c               # Guest init and worker launcher
-│   ├── worker_supervisor.py # Python supervisor
-│   ├── worker_child.py      # Python child executor
-│   ├── worker_supervisor.js # Node supervisor
-│   └── worker_child.js      # Node child executor
+│   ├── worker_supervisor.py  # Python supervisor
+│   ├── worker_child.py       # Python child executor
+│   ├── worker_supervisor.js  # Node supervisor
+│   └── worker_child.js       # Node child executor
 ├── deploy/
 │   ├── deploy.sh            # Versioned deployment script
-│   └── zeroboot.service     # Systemd unit
+│   ├── zeroboot.service     # Systemd unit
+│   ├── docker/              # Docker packaging (Phase B)
+│   │   ├── Dockerfile.runtime
+│   │   ├── docker-compose.yml
+│   │   ├── docker-entrypoint.sh
+│   │   └── .env.example
+│   └── k8s/                 # Kubernetes manifests (Phase C)
+│       ├── namespace.yaml
+│       ├── deployment.yaml
+│       ├── daemonset.yaml
+│       ├── service.yaml
+│       ├── networkpolicy.yaml
+│       ├── pvc-release.yaml
+│       ├── pvc-state.yaml
+│       ├── secret-example.yaml
+│       └── kustomization.yaml
 ├── scripts/
 │   ├── build_guest_rootfs.sh
 │   ├── build_rootfs_image.sh
-│   └── make_api_keys.py
+│   ├── build_release_tree.sh  # Assemble release directory
+│   ├── check_kvm_host.sh      # Host readiness check
+│   ├── fetch_official_artifacts.sh
+│   ├── make_api_keys.py
+│   ├── smoke_exec.sh          # Basic smoke test
+│   └── repeat_smoke.sh        # Soak test for drift detection
+├── docs/
+│   ├── DEPLOYMENT.md          # Phase A: Bare metal
+│   ├── DOCKER.md              # Phase B: Docker
+│   ├── KUBERNETES.md          # Phase C: Kubernetes
+│   ├── API.md
+│   ├── ARCHITECTURE.md
+│   └── COMPATIBILITY.md
 ├── .github/
 │   └── workflows/
-│       └── ci.yml           # CI with KVM smoke tests
+│       └── ci.yml             # CI with KVM smoke tests
 └── tests/
 ```
 
