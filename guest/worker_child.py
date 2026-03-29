@@ -195,7 +195,7 @@ def main() -> int:
         
     except json.JSONDecodeError as e:
         # Protocol error - invalid JSON (classified as internal per test expectations)
-        error_msg = f"invalid JSON payload: {e}".encode("utf-8", "replace")
+        error_msg = f"JSONDecodeError: invalid JSON payload: {e}".encode("utf-8", "replace")
         response = encode_response(
             request_id=request_id,
             exit_code=-1,

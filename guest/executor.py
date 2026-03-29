@@ -59,6 +59,10 @@ def execute_code(
         
         return 0, stdout_buf.getvalue(), stderr_buf.getvalue(), None
         
+    except TimeoutError:
+        # Re-raise TimeoutError so caller can handle it
+        raise
+        
     except Exception as e:
         exception = e
         # Print traceback to stderr buffer
