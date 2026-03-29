@@ -4,11 +4,15 @@
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/v1/exec` | POST | Execute one snippet in a fresh forked VM |
+| `/v1/exec` | POST | Execute one snippet through the pooled strict VM lane |
 | `/v1/exec/batch` | POST | Execute a bounded batch |
 | `/ready` | GET | Startup verification and quarantine state |
 | `/health` | GET | Cached deep guest probe |
 | `/v1/metrics` | GET | Prometheus-style metrics |
+| `/v1/admin/pool` | GET | Admin pool status by language |
+| `/v1/admin/scale` | POST | Admin pool target scaling by language |
+| `/v1/admin/recycle` | POST | Admin recycle of idle or all pooled VMs |
+| `/v1/admin/pool/events` | GET | Recent in-memory pool lifecycle events |
 
 ## POST /v1/exec
 
@@ -67,6 +71,8 @@ Worker-path mapping rules:
 
 If a template was quarantined at startup, execution now returns a validation error with the quarantine detail instead of a vague missing-template error.
 
+The pooled strict lane still runs a fresh child process per request inside the guest. Pooling reuses the guest VM, not the child interpreter state.
+
 ## POST /v1/exec/batch
 
 ```json
@@ -111,6 +117,8 @@ Two modes exist:
 
 - `ZEROBOOT_AUTH_MODE=dev` — missing keys file is allowed
 - `ZEROBOOT_AUTH_MODE=prod` — startup fails without a readable keys file
+
+Admin endpoints use a separate bearer verifier backed by `ZEROBOOT_ADMIN_API_KEYS_FILE`. In dev mode, if that file is absent or unreadable, the admin endpoints remain mounted but return `503 admin API disabled`.
 
 Keys file format:
 

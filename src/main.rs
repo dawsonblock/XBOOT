@@ -1,6 +1,8 @@
 mod api;
 mod auth;
+mod bench;
 mod config;
+mod pool;
 mod protocol;
 mod signing;
 mod startup;
@@ -11,17 +13,22 @@ use anyhow::{bail, Context, Result};
 use axum::extract::DefaultBodyLimit;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::ptr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use api::admin::{
+    pool_events_handler, pool_status_handler, recycle_pool_handler, scale_pool_handler,
+};
 use api::handlers::{
     apply_request_log_path_fix, batch_handler, exec_handler, health_handler, live_handler,
     metrics_handler, ready_handler, AppState, Metrics, Template,
 };
 use config::{AuthMode, ServerConfig};
+use pool::{KvmVmFactory, PoolManager, TemplateRuntime};
 use protocol::GuestRequest;
 use template_manifest::ManifestPolicy;
 #[cfg(target_os = "linux")]
@@ -38,7 +45,8 @@ fn main() -> Result<()> {
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("help");
     match command {
         "template" => cmd_template(&args[2..]),
-        "bench" | "fork-bench" => cmd_fork_bench(&args[2..]),
+        "bench" => bench::cmd_bench(&args[2..]),
+        "fork-bench" => cmd_fork_bench(&args[2..]),
         "serve" => cmd_serve(&args[2..]),
         "test-exec" => cmd_test_exec(&args[2..]),
         "verify-startup" => cmd_verify_startup(&args[2..]),
@@ -48,7 +56,7 @@ fn main() -> Result<()> {
         _ => {
             eprintln!("Usage: zeroboot <command>");
             eprintln!("  template <kernel> <rootfs> <workdir> [wait_secs] [init_path] [mem_mib]");
-            eprintln!("  bench <workdir> [language]");
+            eprintln!("  bench <server_url> <api_key> <admin_api_key> [--out-dir <path>]");
             eprintln!("  test-exec <workdir> [language] <code>");
             eprintln!("  serve <workdir>[,lang:workdir2,...] [port]");
             eprintln!("  verify-startup <workdir>[,lang:workdir2,...] [--release-root <path>]");
@@ -510,6 +518,109 @@ fn load_api_key_verifier(config: &ServerConfig) -> Result<Option<auth::ApiKeyVer
     Ok(Some(verifier))
 }
 
+fn load_admin_api_key_verifier(config: &ServerConfig) -> Result<Option<auth::ApiKeyVerifier>> {
+    let Some(admin_keys_file) = config.admin_api_keys_file.as_ref() else {
+        if matches!(config.auth_mode, AuthMode::Prod) {
+            bail!("auth mode is prod but ZEROBOOT_ADMIN_API_KEYS_FILE is missing");
+        }
+        eprintln!("  Dev mode: admin API disabled (no ZEROBOOT_ADMIN_API_KEYS_FILE)");
+        return Ok(None);
+    };
+
+    let pepper = match std::fs::read_to_string(&config.api_key_pepper_file) {
+        Ok(pepper) => pepper.trim().to_string(),
+        Err(e) => {
+            if matches!(config.auth_mode, AuthMode::Prod) {
+                bail!("admin auth requires pepper file: {}", e);
+            }
+            eprintln!("  Dev mode: admin API disabled (pepper unavailable: {})", e);
+            return Ok(None);
+        }
+    };
+
+    if pepper.is_empty() {
+        if matches!(config.auth_mode, AuthMode::Prod) {
+            bail!("admin auth requires non-empty pepper file");
+        }
+        eprintln!("  Dev mode: admin API disabled (empty pepper)");
+        return Ok(None);
+    }
+
+    match auth::ApiKeyVerifier::load_from_file(admin_keys_file, &pepper) {
+        Ok(verifier) => {
+            if verifier.is_empty() {
+                if matches!(config.auth_mode, AuthMode::Prod) {
+                    bail!("admin auth requires at least one active admin API key");
+                }
+                eprintln!("  Dev mode: admin API disabled (no active admin keys)");
+                return Ok(None);
+            }
+            eprintln!(
+                "  Loaded {} admin API keys from {}",
+                verifier.len(),
+                admin_keys_file.display()
+            );
+            Ok(Some(verifier))
+        }
+        Err(e) => {
+            if matches!(config.auth_mode, AuthMode::Prod) {
+                bail!("admin auth requires valid admin API key file: {}", e);
+            }
+            eprintln!("  Dev mode: admin API disabled ({})", e);
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn base_config(temp: &std::path::Path) -> ServerConfig {
+        ServerConfig {
+            auth_mode: AuthMode::Dev,
+            api_keys_file: temp.join("api_keys.json"),
+            api_key_pepper_file: temp.join("pepper"),
+            admin_api_keys_file: None,
+            trusted_proxies: vec![],
+            limits: config::Limits::default(),
+            logging: config::LoggingConfig::default(),
+            health: config::HealthConfig::default(),
+            bind_addr: "127.0.0.1".into(),
+            queue: config::QueueConfig::default(),
+            storage: config::StorageConfig::default(),
+            artifacts: config::ArtifactConfig::default(),
+            pool: config::PoolConfig::default(),
+        }
+    }
+
+    #[test]
+    fn load_admin_verifier_disabled_without_file_in_dev() {
+        let dir = tempdir().unwrap();
+        let config = base_config(dir.path());
+        let verifier = load_admin_api_key_verifier(&config).unwrap();
+        assert!(verifier.is_none());
+    }
+
+    #[test]
+    fn load_admin_verifier_loads_valid_dev_key_file() {
+        let dir = tempdir().unwrap();
+        let mut config = base_config(dir.path());
+        let pepper = "dev-pepper";
+        std::fs::write(&config.api_key_pepper_file, pepper).unwrap();
+        let (_, record) = auth::generate_api_key("admin", pepper);
+        let admin_keys = serde_json::to_vec(&vec![record]).unwrap();
+        let admin_path = dir.path().join("admin_keys.json");
+        std::fs::write(&admin_path, admin_keys).unwrap();
+        config.admin_api_keys_file = Some(admin_path);
+
+        let verifier = load_admin_api_key_verifier(&config).unwrap();
+        assert!(verifier.is_some());
+        assert_eq!(verifier.unwrap().len(), 1);
+    }
+}
+
 fn cmd_serve(args: &[String]) -> Result<()> {
     if args.is_empty() {
         bail!("Usage: zeroboot serve <workdir>[,lang:workdir2,...] [port]");
@@ -524,6 +635,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
 
     let mut templates = std::collections::HashMap::new();
     let mut template_statuses = std::collections::HashMap::new();
+    let mut pool_templates = HashMap::new();
     let mut quarantined = 0u64;
     for spec in &parsed_specs {
         let lang = spec.language.clone();
@@ -532,11 +644,23 @@ fn cmd_serve(args: &[String]) -> Result<()> {
         match validate_snapshot_workdir(&dir, Some(&lang), Some(&config)) {
             Ok(()) => {
                 let (snapshot, memfd) = load_snapshot(&dir, Some(&lang), Some(&config))?;
+                let snapshot = Arc::new(snapshot);
                 eprintln!("  Template '{}' loaded from {}", lang, dir);
                 templates.insert(
                     lang.clone(),
                     Template {
                         snapshot,
+                        memfd,
+                        workdir: dir.clone(),
+                    },
+                );
+                pool_templates.insert(
+                    lang.clone(),
+                    TemplateRuntime {
+                        snapshot: templates
+                            .get(&lang)
+                            .map(|template| template.snapshot.clone())
+                            .expect("template inserted before pool runtime"),
                         memfd,
                         workdir: dir.clone(),
                     },
@@ -574,6 +698,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     }
 
     let api_key_verifier = load_api_key_verifier(&config)?;
+    let admin_api_key_verifier = load_admin_api_key_verifier(&config)?;
 
     eprintln!("  Auth mode: {:?}", config.auth_mode);
     eprintln!("  Trusted proxies: {}", config.trusted_proxies.len());
@@ -600,16 +725,36 @@ fn cmd_serve(args: &[String]) -> Result<()> {
 
     let (request_log_tx, mut request_log_rx) =
         tokio::sync::mpsc::channel::<String>(config.storage.request_log_queue_capacity);
-    let metrics = Metrics::new();
+    let metrics = Arc::new(Metrics::new());
     metrics
         .template_quarantines
         .store(quarantined, std::sync::atomic::Ordering::Relaxed);
+    let pool = PoolManager::new(
+        pool_templates.keys().cloned().collect(),
+        config.pool.clone(),
+        Arc::new(KvmVmFactory::new(pool_templates)),
+        metrics.clone(),
+    )?;
+    pool.bootstrap();
+    pool.start_background_tasks();
+    let pool_status = pool.status();
+    for (language, lane) in &pool_status.lanes {
+        if lane.target_idle > 0 && lane.idle == 0 && lane.active == 0 {
+            if let Some(status) = template_statuses.get_mut(language) {
+                status.ready = false;
+                status.detail = "pool bootstrap could not prefill an idle VM".into();
+                status.health = api::handlers::TemplateHealth::QuarantinedHealth;
+            }
+        }
+    }
     let state = Arc::new(AppState {
         templates,
         template_statuses,
         api_key_verifier,
+        admin_api_key_verifier,
         rate_limiters: std::sync::Mutex::new(std::collections::HashMap::new()),
         metrics,
+        pool,
         execution_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.limits.max_concurrent_requests,
         )),
@@ -669,6 +814,16 @@ fn cmd_serve(args: &[String]) -> Result<()> {
             .route("/exec", axum::routing::post(exec_handler))
             .route("/v1/exec", axum::routing::post(exec_handler))
             .route("/v1/exec/batch", axum::routing::post(batch_handler))
+            .route("/v1/admin/pool", axum::routing::get(pool_status_handler))
+            .route("/v1/admin/scale", axum::routing::post(scale_pool_handler))
+            .route(
+                "/v1/admin/recycle",
+                axum::routing::post(recycle_pool_handler),
+            )
+            .route(
+                "/v1/admin/pool/events",
+                axum::routing::get(pool_events_handler),
+            )
             .route("/live", axum::routing::get(live_handler))
             .route("/ready", axum::routing::get(ready_handler))
             .route("/health", axum::routing::get(health_handler))

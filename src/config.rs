@@ -65,6 +65,9 @@ pub struct PoolConfig {
     pub max_idle_per_lang: usize,
     pub borrow_timeout_ms: u64,
     pub health_check_interval_secs: u64,
+    pub max_requests_per_vm: u32,
+    pub max_cumulative_exec_ms_per_vm: u64,
+    pub event_buffer_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +75,7 @@ pub struct ServerConfig {
     pub auth_mode: AuthMode,
     pub api_keys_file: PathBuf,
     pub api_key_pepper_file: PathBuf,
+    pub admin_api_keys_file: Option<PathBuf>,
     pub trusted_proxies: Vec<IpAddr>,
     pub limits: Limits,
     pub logging: LoggingConfig,
@@ -120,6 +124,10 @@ impl ServerConfig {
             api_key_pepper_file: env::var("ZEROBOOT_API_KEY_PEPPER_FILE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/etc/zeroboot/pepper")),
+            admin_api_keys_file: env::var("ZEROBOOT_ADMIN_API_KEYS_FILE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from),
             trusted_proxies,
             limits: Limits {
                 max_request_body_bytes: usize_env("ZEROBOOT_MAX_REQUEST_BODY_BYTES", 256 * 1024),
@@ -179,6 +187,12 @@ impl ServerConfig {
                 max_idle_per_lang: usize_env("ZEROBOOT_POOL_MAX_PER_LANG", 4),
                 borrow_timeout_ms: u64_env("ZEROBOOT_POOL_BORROW_TIMEOUT_MS", 5000),
                 health_check_interval_secs: u64_env("ZEROBOOT_POOL_HEALTH_CHECK_INTERVAL_SECS", 30),
+                max_requests_per_vm: u64_env("ZEROBOOT_POOL_MAX_REQUESTS_PER_VM", 128) as u32,
+                max_cumulative_exec_ms_per_vm: u64_env(
+                    "ZEROBOOT_POOL_MAX_CUMULATIVE_EXEC_MS_PER_VM",
+                    300_000,
+                ),
+                event_buffer_size: usize_env("ZEROBOOT_POOL_EVENT_BUFFER_SIZE", 256),
             },
         })
     }
@@ -261,6 +275,16 @@ impl ServerConfig {
             );
         }
 
+        let admin_api_keys_file = self.admin_api_keys_file.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("prod mode requires ZEROBOOT_ADMIN_API_KEYS_FILE to be set")
+        })?;
+        if !admin_api_keys_file.is_file() {
+            bail!(
+                "prod mode requires admin_api_keys_file to be a file: {}",
+                admin_api_keys_file.display()
+            );
+        }
+
         // Validate log_code is false in prod
         if self.logging.log_code {
             bail!("prod mode requires logging.log_code=false (no code logging in prod)");
@@ -301,6 +325,7 @@ mod tests {
             auth_mode: AuthMode::Dev,
             api_keys_file: PathBuf::from("api_keys.json"),
             api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            admin_api_keys_file: None,
             trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
             limits: Limits {
                 max_request_body_bytes: 1,
@@ -341,6 +366,9 @@ mod tests {
                 max_idle_per_lang: 4,
                 borrow_timeout_ms: 5000,
                 health_check_interval_secs: 30,
+                max_requests_per_vm: 128,
+                max_cumulative_exec_ms_per_vm: 300_000,
+                event_buffer_size: 256,
             },
         };
         assert!(cfg.is_trusted_proxy("127.0.0.1".parse().unwrap()));
@@ -353,6 +381,7 @@ mod tests {
             auth_mode: AuthMode::Prod,
             api_keys_file: PathBuf::from("api_keys.json"),
             api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            admin_api_keys_file: Some(PathBuf::from("/etc/zeroboot/admin_keys.json")),
             trusted_proxies: vec![],
             limits: Limits::default(),
             logging: LoggingConfig {
@@ -385,6 +414,7 @@ mod tests {
             auth_mode: AuthMode::Prod,
             api_keys_file: PathBuf::from("api_keys.json"),
             api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            admin_api_keys_file: Some(PathBuf::from("/etc/zeroboot/admin_keys.json")),
             trusted_proxies: vec![],
             limits: Limits::default(),
             logging: LoggingConfig {
@@ -421,6 +451,7 @@ mod tests {
             auth_mode: AuthMode::Prod,
             api_keys_file: PathBuf::from("api_keys.json"),
             api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            admin_api_keys_file: Some(PathBuf::from("/etc/zeroboot/admin_keys.json")),
             trusted_proxies: vec![],
             limits: Limits::default(),
             logging: LoggingConfig {
@@ -457,6 +488,7 @@ mod tests {
             auth_mode: AuthMode::Dev,
             api_keys_file: PathBuf::from("api_keys.json"),
             api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            admin_api_keys_file: None,
             trusted_proxies: vec![],
             limits: Limits::default(),
             logging: LoggingConfig {
@@ -491,6 +523,7 @@ mod tests {
             auth_mode: AuthMode::Dev,
             api_keys_file: PathBuf::from("api_keys.json"),
             api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            admin_api_keys_file: None,
             trusted_proxies: vec![],
             limits: Limits::default(),
             logging: LoggingConfig::default(),
@@ -510,6 +543,7 @@ mod tests {
             auth_mode: AuthMode::Prod,
             api_keys_file: PathBuf::from("api_keys.json"),
             api_key_pepper_file: PathBuf::from("/etc/zeroboot/pepper"),
+            admin_api_keys_file: None,
             trusted_proxies: vec![],
             limits: Limits::default(),
             logging: LoggingConfig::default(),
@@ -583,6 +617,9 @@ impl Default for PoolConfig {
             max_idle_per_lang: 4,
             borrow_timeout_ms: 5000,
             health_check_interval_secs: 30,
+            max_requests_per_vm: 128,
+            max_cumulative_exec_ms_per_vm: 300_000,
+            event_buffer_size: 256,
         }
     }
 }

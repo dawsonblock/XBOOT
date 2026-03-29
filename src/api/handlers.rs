@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::auth;
+use crate::pool::{LeaseOutcome, PoolManager, RecycleReason};
 use crate::startup;
 
 fn process_memory_usage_bytes() -> u64 {
@@ -37,7 +38,7 @@ use tokio::sync::{mpsc::Sender, OwnedSemaphorePermit, Semaphore};
 
 use crate::config::ServerConfig;
 use crate::protocol::{encode_request_frame, GuestRequest, GuestResponse};
-use crate::vmm::kvm::{ForkedVm, VmSnapshot};
+use crate::vmm::kvm::VmSnapshot;
 
 #[derive(Deserialize, Clone)]
 pub struct ExecRequest {
@@ -160,7 +161,7 @@ impl TokenBucket {
 }
 
 pub struct Template {
-    pub snapshot: VmSnapshot,
+    pub snapshot: Arc<VmSnapshot>,
     pub memfd: i32,
     #[allow(dead_code)]
     pub workdir: String,
@@ -170,8 +171,10 @@ pub struct AppState {
     pub templates: HashMap<String, Template>,
     pub template_statuses: HashMap<String, TemplateStatus>,
     pub api_key_verifier: Option<auth::ApiKeyVerifier>,
+    pub admin_api_key_verifier: Option<auth::ApiKeyVerifier>,
     pub rate_limiters: Mutex<HashMap<String, TokenBucket>>,
-    pub metrics: Metrics,
+    pub metrics: Arc<Metrics>,
+    pub pool: Arc<PoolManager>,
     pub config: ServerConfig,
     pub execution_semaphore: Arc<Semaphore>,
     pub request_log_tx: Sender<String>,
@@ -205,7 +208,7 @@ impl Histogram {
         }
     }
 
-    fn observe(&self, value_ms: f64) {
+    pub(crate) fn observe(&self, value_ms: f64) {
         let slot = HISTOGRAM_BUCKETS_MS
             .iter()
             .position(|&bound| value_ms <= bound)
@@ -216,7 +219,7 @@ impl Histogram {
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn render(&self, name: &str, help: &str) -> String {
+    pub(crate) fn render(&self, name: &str, help: &str) -> String {
         let mut out = format!("# HELP {} {}\n# TYPE {} histogram\n", name, help, name);
         let mut cumulative = 0u64;
         for (i, &bound) in HISTOGRAM_BUCKETS_MS.iter().enumerate() {
@@ -270,10 +273,15 @@ pub struct Metrics {
     pub exec_time_hist: Histogram,
     pub total_time_hist: Histogram,
     pub queue_wait_time_hist: Histogram,
+    pub pool_borrow_time_hist: Histogram,
+    pub lease_release_time_hist: Histogram,
     pub protocol_errors: AtomicU64,
     pub output_truncations: AtomicU64,
     pub worker_recycles: AtomicU64,
     pub queue_rejections: AtomicU64,
+    pub pool_borrow_timeouts: AtomicU64,
+    pub pool_recycles: AtomicU64,
+    pub pool_quarantines: AtomicU64,
     pub health_failures: AtomicU64,
     pub template_quarantines: AtomicU64,
     // Additional trust chain and restore metrics (Commit 14)
@@ -288,6 +296,7 @@ pub struct Metrics {
     pub request_log_write_failures: AtomicU64,
     pub request_log_drops: AtomicU64,
     pub language_counters: Mutex<HashMap<String, LanguageMetrics>>,
+    pub request_mode_counters: Mutex<HashMap<String, u64>>,
 }
 
 impl Metrics {
@@ -303,10 +312,15 @@ impl Metrics {
             exec_time_hist: Histogram::new(),
             total_time_hist: Histogram::new(),
             queue_wait_time_hist: Histogram::new(),
+            pool_borrow_time_hist: Histogram::new(),
+            lease_release_time_hist: Histogram::new(),
             protocol_errors: AtomicU64::new(0),
             output_truncations: AtomicU64::new(0),
             worker_recycles: AtomicU64::new(0),
             queue_rejections: AtomicU64::new(0),
+            pool_borrow_timeouts: AtomicU64::new(0),
+            pool_recycles: AtomicU64::new(0),
+            pool_quarantines: AtomicU64::new(0),
             health_failures: AtomicU64::new(0),
             template_quarantines: AtomicU64::new(0),
             // Additional trust chain and restore metrics (Commit 14)
@@ -321,6 +335,7 @@ impl Metrics {
             request_log_write_failures: AtomicU64::new(0),
             request_log_drops: AtomicU64::new(0),
             language_counters: Mutex::new(HashMap::new()),
+            request_mode_counters: Mutex::new(HashMap::new()),
         }
     }
 
@@ -335,6 +350,15 @@ impl Metrics {
             "timeout" => entry.timeout += 1,
             _ => entry.error += 1,
         }
+    }
+
+    fn record_request_mode(&self, language: &str, mode: &str) {
+        let mut counters = match self.request_mode_counters.lock() {
+            Ok(counters) => counters,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let key = format!("{}:{}", language, mode);
+        *counters.entry(key).or_insert(0) += 1;
     }
 }
 
@@ -626,42 +650,44 @@ fn execute_code_internal(
                 0.0,
             );
         }
-        let template = match state.templates.get(&lang) {
-            Some(t) => t,
-            None => {
-                state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
-                let detail = state
-                    .template_statuses
-                    .get(&lang)
-                    .map(|status| status.detail.clone())
-                    .unwrap_or_else(|| format!("No template for language: {}", req.language));
-                return error_response(request_id, detail, "validation", total_start, 0.0, 0.0);
-            }
-        };
+        if !state.pool.has_language(&lang) {
+            state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
+            let detail = state
+                .template_statuses
+                .get(&lang)
+                .map(|status| status.detail.clone())
+                .unwrap_or_else(|| format!("No template for language: {}", req.language));
+            return error_response(request_id, detail, "validation", total_start, 0.0, 0.0);
+        }
 
-        let mut vm = match ForkedVm::fork_cow(&template.snapshot, template.memfd) {
-            Ok(vm) => vm,
+        let mut lease = match state.pool.borrow(
+            &lang,
+            Duration::from_millis(state.config.pool.borrow_timeout_ms.max(1)),
+        ) {
+            Ok(lease) => lease,
             Err(e) => {
                 state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
                 return error_response(
                     request_id,
-                    format!("Fork failed: {}", e),
-                    "fork",
+                    format!("Pool borrow failed: {}", e),
+                    "overload",
                     total_start,
                     0.0,
                     0.0,
                 );
             }
         };
-        let fork_time_ms = round2(vm.fork_time_us / 1000.0);
+
+        let fork_time_us = lease.vm_mut().fork_time_us();
+        let fork_time_ms = round2(fork_time_us / 1000.0);
         state
             .metrics
             .fork_time_sum_us
-            .fetch_add(vm.fork_time_us as u64, Ordering::Relaxed);
-        state
-            .metrics
-            .fork_time_hist
-            .observe(vm.fork_time_us / 1000.0);
+            .fetch_add(fork_time_us as u64, Ordering::Relaxed);
+        state.metrics.fork_time_hist.observe(fork_time_ms);
+        if matches!(mode, ExecutionMode::User) {
+            state.metrics.record_request_mode(&lang, "strict");
+        }
 
         let request_frame = encode_request_frame(&GuestRequest {
             request_id: request_id.to_string(),
@@ -671,8 +697,11 @@ fn execute_code_internal(
             timeout_ms: req.timeout_seconds * 1000,
         });
 
-        if let Err(e) = vm.send_serial(&request_frame) {
+        if let Err(e) = lease.vm_mut().send_serial(&request_frame) {
             state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
+            lease.finish(LeaseOutcome::Quarantined {
+                reason: RecycleReason::TransportFailure,
+            });
             return error_response(
                 request_id,
                 format!("Send failed: {}", e),
@@ -685,40 +714,51 @@ fn execute_code_internal(
 
         let exec_start = Instant::now();
         let timeout = Duration::from_secs(req.timeout_seconds);
-        let guest_response: GuestResponse = match vm.run_until_response_timeout(Some(timeout)) {
-            Ok(resp) => resp,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("timed out") {
-                    state.metrics.total_timeouts.fetch_add(1, Ordering::Relaxed);
-                    state.metrics.record_language_outcome(&lang, "timeout");
+        let guest_response: GuestResponse =
+            match lease.vm_mut().run_until_response_timeout(Some(timeout)) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let exec_time_ms = round2(exec_start.elapsed().as_secs_f64() * 1000.0);
+                    lease.record_exec(exec_time_ms.max(0.0) as u64);
+                    if msg.contains("timed out") {
+                        lease.record_timeout();
+                        lease.finish(LeaseOutcome::Recycled {
+                            reason: RecycleReason::HostTimeout,
+                        });
+                        state.metrics.total_timeouts.fetch_add(1, Ordering::Relaxed);
+                        state.metrics.record_language_outcome(&lang, "timeout");
+                        return error_response(
+                            request_id,
+                            format!("Execution timed out after {}s", req.timeout_seconds),
+                            "timeout",
+                            total_start,
+                            fork_time_ms,
+                            exec_time_ms,
+                        );
+                    }
+                    lease.finish(LeaseOutcome::Quarantined {
+                        reason: RecycleReason::ProtocolFailure,
+                    });
+                    state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
+                    state
+                        .metrics
+                        .protocol_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.metrics.record_language_outcome(&lang, "error");
                     return error_response(
                         request_id,
-                        format!("Execution timed out after {}s", req.timeout_seconds),
-                        "timeout",
+                        format!("Protocol failure: {}", msg),
+                        "protocol",
                         total_start,
                         fork_time_ms,
-                        round2(exec_start.elapsed().as_secs_f64() * 1000.0),
+                        exec_time_ms,
                     );
                 }
-                state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
-                state
-                    .metrics
-                    .protocol_errors
-                    .fetch_add(1, Ordering::Relaxed);
-                state.metrics.record_language_outcome(&lang, "error");
-                return error_response(
-                    request_id,
-                    format!("Protocol failure: {}", msg),
-                    "protocol",
-                    total_start,
-                    fork_time_ms,
-                    round2(exec_start.elapsed().as_secs_f64() * 1000.0),
-                );
-            }
-        };
+            };
 
         let exec_time_ms = round2(exec_start.elapsed().as_secs_f64() * 1000.0);
+        lease.record_exec(exec_time_ms.max(0.0) as u64);
         state.metrics.exec_time_sum_us.fetch_add(
             (exec_start.elapsed().as_secs_f64() * 1_000_000.0) as u64,
             Ordering::Relaxed,
@@ -741,6 +781,9 @@ fn execute_code_internal(
                 .protocol_errors
                 .fetch_add(1, Ordering::Relaxed);
             state.metrics.record_language_outcome(&lang, "error");
+            lease.finish(LeaseOutcome::Quarantined {
+                reason: RecycleReason::ProtocolFailure,
+            });
             return error_response(
                 request_id,
                 format!(
@@ -794,6 +837,18 @@ fn execute_code_internal(
         } else {
             guest_response.error_type.clone()
         };
+        let lease_outcome = if guest_response.recycle_requested {
+            LeaseOutcome::Recycled {
+                reason: RecycleReason::GuestRequested,
+            }
+        } else if guest_response.exit_code < 0 {
+            lease.record_signal_death();
+            LeaseOutcome::Quarantined {
+                reason: RecycleReason::ChildSignalDeath,
+            }
+        } else {
+            LeaseOutcome::ReturnedIdle
+        };
         if guest_response.exit_code == 0 && runtime_error_type == "ok" {
             state.metrics.record_language_outcome(&lang, "ok");
         } else if runtime_error_type == "timeout" {
@@ -803,6 +858,7 @@ fn execute_code_internal(
             state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
             state.metrics.record_language_outcome(&lang, "error");
         }
+        lease.finish(lease_outcome);
 
         ExecResponse {
             id: request_id.to_string(),
@@ -1202,6 +1258,7 @@ pub async fn ready_handler(State(state): State<Arc<AppState>>) -> Json<HealthRes
 
 pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
     let m = &state.metrics;
+    let pool_status = state.pool.status();
     let total = m.total_executions.load(Ordering::Relaxed);
     let errors = m.total_errors.load(Ordering::Relaxed);
     let timeouts = m.total_timeouts.load(Ordering::Relaxed);
@@ -1262,6 +1319,24 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
         "Total number of queue rejections",
         "counter",
         m.queue_rejections.load(Ordering::Relaxed).to_string(),
+    );
+    push_metric(
+        "zeroboot_pool_borrow_timeouts",
+        "Total number of pool borrow timeouts",
+        "counter",
+        m.pool_borrow_timeouts.load(Ordering::Relaxed).to_string(),
+    );
+    push_metric(
+        "zeroboot_pool_recycles_total",
+        "Total number of pooled VM recycles",
+        "counter",
+        m.pool_recycles.load(Ordering::Relaxed).to_string(),
+    );
+    push_metric(
+        "zeroboot_pool_quarantines_total",
+        "Total number of pooled VM quarantines",
+        "counter",
+        m.pool_quarantines.load(Ordering::Relaxed).to_string(),
     );
     push_metric(
         "zeroboot_health_failures",
@@ -1407,11 +1482,41 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
         "zeroboot_queue_wait_time_milliseconds",
         "Distribution of queue wait time before execution in milliseconds",
     ));
+    out.push_str(&m.pool_borrow_time_hist.render(
+        "zeroboot_pool_borrow_time_milliseconds",
+        "Distribution of pool borrow latency in milliseconds",
+    ));
+    out.push_str(&m.lease_release_time_hist.render(
+        "zeroboot_pool_release_time_milliseconds",
+        "Distribution of lease release and recycle time in milliseconds",
+    ));
     for (language, status) in state.template_statuses.iter() {
         out.push_str(&format!(
             "# TYPE zeroboot_template_ready gauge\nzeroboot_template_ready{{language=\"{}\"}} {}\n",
             language,
             if status.ready { 1 } else { 0 }
+        ));
+    }
+    for (language, lane) in pool_status.lanes.iter() {
+        out.push_str(&format!(
+            "# TYPE zeroboot_pool_idle_vms gauge\nzeroboot_pool_idle_vms{{language=\"{}\"}} {}\n",
+            language, lane.idle
+        ));
+        out.push_str(&format!(
+            "# TYPE zeroboot_pool_active_vms gauge\nzeroboot_pool_active_vms{{language=\"{}\"}} {}\n",
+            language, lane.active
+        ));
+        out.push_str(&format!(
+            "# TYPE zeroboot_pool_target_vms gauge\nzeroboot_pool_target_vms{{language=\"{}\"}} {}\n",
+            language, lane.target_idle
+        ));
+        out.push_str(&format!(
+            "# TYPE zeroboot_pool_waiters gauge\nzeroboot_pool_waiters{{language=\"{}\"}} {}\n",
+            language, lane.waiters
+        ));
+        out.push_str(&format!(
+            "# TYPE zeroboot_pool_quarantined gauge\nzeroboot_pool_quarantined{{language=\"{}\"}} {}\n",
+            language, lane.quarantined
         ));
     }
     let counters = match m.language_counters.lock() {
@@ -1423,6 +1528,18 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
             "# TYPE zeroboot_language_executions_total counter\nzeroboot_language_executions_total{{language=\"{}\",result=\"ok\"}} {}\nzeroboot_language_executions_total{{language=\"{}\",result=\"error\"}} {}\nzeroboot_language_executions_total{{language=\"{}\",result=\"timeout\"}} {}\n",
             language, stats.ok, language, stats.error, language, stats.timeout
         ));
+    }
+    let request_modes = match m.request_mode_counters.lock() {
+        Ok(counters) => counters,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for (key, total) in request_modes.iter() {
+        if let Some((language, mode)) = key.split_once(':') {
+            out.push_str(&format!(
+                "# TYPE zeroboot_request_mode_total counter\nzeroboot_request_mode_total{{language=\"{}\",mode=\"{}\"}} {}\n",
+                language, mode, total
+            ));
+        }
     }
     out
 }

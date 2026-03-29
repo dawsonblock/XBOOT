@@ -94,6 +94,17 @@ This subprocess-based model provides:
 
 This model is designed to contain normal request-to-request state bleed. It is not positioned as a hostile public multitenant isolation boundary by itself.
 
+### Pooled Strict Lane
+
+XBOOT now also exposes a **pooled strict** control plane for low-latency internal execution:
+
+- The host keeps an in-memory pool of reusable guest VMs per language
+- Each request still executes through the strict guest supervisor path and a fresh child process
+- Idle VMs are health-probed in the background and quarantined on protocol or health failure
+- Admin APIs expose pool status, target scaling, recycle actions, and recent pool events
+
+This changes the performance model from "fresh VM per request" to "fresh child per request inside a reused guest VM." It improves latency for short jobs, but it is still aimed at controlled internal workloads rather than hostile public multitenancy.
+
 ### Key Features
 
 | Feature | Description |
@@ -216,8 +227,9 @@ zeroboot serve
 │   └── Promotion channels (dev → staging → prod)
 └── Runtime
     ├── Snapshot restore / fork path
+    ├── Pooled strict VM lanes for Python and Node
     ├── Health and readiness surfaces
-    └── No server-side warm pool in this pass
+    └── Admin pool API and benchmark harness
 ```
 
 ### Trust Model
@@ -454,8 +466,9 @@ The guest init applies setrlimit():
 
 - [x] Full signature verification with trusted keyring (Ed25519 via ring crate)
 - [x] Pinned artifact matrix and promoted-template workflow
+- [x] Pooled strict VM lane with admin scaling and recycle APIs
 - [ ] Self-hosted KVM lane as a required release gate
-- [ ] Warm pool autoscaling (experimental, no server-side pool yet)
+- [ ] Fast guest-worker mode on top of the pooled strict lane
 
 ---
 
