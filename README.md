@@ -100,79 +100,84 @@ This is explicit because upstream no longer publishes an Ubuntu 22.04 artifact s
 
 ---
 
-## Quick Start
+## Quick Start (Docker - Recommended)
 
-### Deployment Options
+The fastest way to run XBOOT is using Docker. This handles all dependencies and provides a consistent environment.
 
-XBOOT supports three deployment phases:
+### Requirements
 
-| Phase | Method | Use Case | Prerequisites |
-|-------|--------|----------|---------------|
-| **A** | [Bare Metal/Systemd](./docs/DEPLOYMENT.md) | Production on dedicated hosts | Ubuntu 22.04 + KVM + Firecracker 1.12.0 |
-| **B** | [Docker](./docs/DOCKER.md) | Development, testing, portability | Same as Phase A + Docker |
-| **C** | [Kubernetes](./docs/KUBERNETES.md) | Fleet deployment, orchestration | Same as Phase A + K8s cluster |
+- **Docker** with daemon running
+- **KVM support** on host (`/dev/kvm` must be accessible)
+- **Rust toolchain** (for initial binary build)
+- **Python 3** (for API key generation)
 
-**Important**: Phase A (bare metal) must be stable before containerizing. The Docker and Kubernetes phases are packaging layers, not replacements for KVM isolation.
-
-### Quick Deploy (Bare Metal)
+### One-Command Setup
 
 ```bash
-# 1. Check host readiness
-./scripts/check_kvm_host.sh
+./scripts/setup-docker.sh setup
+```
 
-# 2. Fetch pinned artifacts
-bash scripts/fetch_official_artifacts.sh /var/lib/zeroboot/artifacts
+This will:
+1. Check Docker and KVM availability
+2. Build the zeroboot binary
+3. Download Firecracker 1.12.0, kernel, and rootfs artifacts
+4. Build Python and Node.js guest templates
+5. Generate API keys and secrets
+6. Build the Docker image
+7. Start the container with docker-compose
+8. Run smoke tests to verify
 
-# 3. Build and create templates
+After completion, XBOOT is available at `http://127.0.0.1:8080`.
+
+### Manual Docker Steps
+
+If you prefer manual control:
+
+```bash
+# Build everything
 make build
+bash scripts/fetch_official_artifacts.sh /var/lib/zeroboot/artifacts
 make guest-python && make image-python && make template-python
 make guest-node && make image-node && make template-node
 
-# 4. Assemble release tree
-./scripts/build_release_tree.sh
+# Setup and run with Docker
+./scripts/setup-docker.sh secrets
+./scripts/setup-docker.sh build
+./scripts/setup-docker.sh run
 
-# 5. Verify startup
-/var/lib/zeroboot/current/bin/zeroboot verify-startup \
-    "python:/var/lib/zeroboot/current/templates/python,node:/var/lib/zeroboot/current/templates/node" \
-    --release-root /var/lib/zeroboot/current
-
-# 6. Run smoke tests
-./scripts/smoke_exec.sh <api-key> http://127.0.0.1:8080
-./scripts/repeat_smoke.sh <api-key> http://127.0.0.1:8080 100
-
-# 7. Install systemd service
-sudo cp deploy/zeroboot.service /etc/systemd/system/
-sudo systemctl enable --now zeroboot
+# Test
+./scripts/setup-docker.sh test
 ```
 
-### Docker Quick Start
+### Docker Commands
 
 ```bash
-# Build and run with Docker Compose
-make docker-compose-up
+# Check status
+./scripts/setup-docker.sh status
 
-# Run smoke tests
-make docker-smoke
+# View logs
+./scripts/setup-docker.sh logs
+
+# Stop services
+./scripts/setup-docker.sh stop
+
+# Clean up everything
+./scripts/setup-docker.sh clean
 ```
 
-See [docs/DOCKER.md](./docs/DOCKER.md) for full Docker deployment guide.
+See [docs/DOCKER.md](./docs/DOCKER.md) for advanced Docker configuration.
 
-### Kubernetes Quick Start
+## Alternative Deployment Methods
 
-```bash
-# Label and taint KVM nodes
-kubectl label node <node> sandbox.kvm=true
-kubectl taint node <node> sandbox.kvm=true:NoSchedule
+While Docker is recommended, XBOOT also supports:
 
-# Deploy with Kustomize
-kubectl apply -k deploy/k8s/
+| Method | Use Case | Documentation |
+|--------|----------|---------------|
+| **Bare Metal** | Production without containers | [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) |
+| **Kubernetes** | Fleet orchestration | [docs/KUBERNETES.md](./docs/KUBERNETES.md) |
+| **Systemd** | Traditional service management | [deploy/zeroboot.service](./deploy/zeroboot.service) |
 
-# Port forward and test
-kubectl port-forward -n xboot svc/xboot 8080:8080
-./scripts/smoke_exec.sh <api-key> http://127.0.0.1:8080
-```
-
-See [docs/KUBERNETES.md](./docs/KUBERNETES.md) for full Kubernetes deployment guide.
+**Note**: All methods still require KVM support on the host. Docker and Kubernetes are packaging layers around the same KVM-based isolation.
 
 ---
 
@@ -351,6 +356,7 @@ XBOOT/
 │   ├── check_kvm_host.sh      # Host readiness check
 │   ├── fetch_official_artifacts.sh
 │   ├── make_api_keys.py
+│   ├── setup-docker.sh        # **Docker setup script (recommended)**
 │   ├── smoke_exec.sh          # Basic smoke test
 │   └── repeat_smoke.sh        # Soak test for drift detection
 ├── docs/
