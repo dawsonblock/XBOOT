@@ -94,6 +94,22 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(error_type, 'protocol')
         self.assertIn('truncated child response payload', stderr)
 
+    def test_child_payload_with_trailing_bytes_is_protocol_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child = Path(tmp) / 'extra_bytes_child.py'
+            child.write_text(
+                "import sys\n"
+                "sys.stdout.buffer.write(b'WRK1R 2 0 ok 1 0 0\\n')\n"
+                "sys.stdout.buffer.write(b't1xextra')\n"
+                "sys.stdout.buffer.flush()\n",
+                encoding='utf-8',
+            )
+            rid, exit_code, error_type, _stdout, stderr, _flags = self.run_worker('print(1)', child_script=child)
+        self.assertEqual(rid, b't1')
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(error_type, 'protocol')
+        self.assertIn('unexpected trailing bytes', stderr)
+
     def test_raw_child_signal_is_internal_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             child = Path(tmp) / 'sigkill_child.py'

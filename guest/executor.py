@@ -16,7 +16,7 @@ def execute_code(
     code: str,
     stdin_data: str = "",
     env: Optional[Dict[str, str]] = None,
-) -> Tuple[int, str, str, Optional[Exception]]:
+) -> Tuple[int, str, str, Optional[BaseException]]:
     """Execute Python code in a clean namespace.
     
     Args:
@@ -49,7 +49,7 @@ def execute_code(
     old_stdin = sys.stdin
     sys.stdin = io.StringIO(stdin_data)
     
-    exception: Optional[Exception] = None
+    exception: Optional[BaseException] = None
     
     try:
         with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
@@ -63,7 +63,7 @@ def execute_code(
         # Re-raise TimeoutError so caller can handle it
         raise
         
-    except Exception as e:
+    except BaseException as e:
         exception = e
         # Print traceback to stderr buffer
         traceback.print_exc(file=stderr_buf)

@@ -46,10 +46,11 @@ pub fn pre_restore_validate(
     }
 
     // 3. Verify we can detect the offset shift (IOAPIC base address must be present)
-    if detect_offset_shift(data).is_err() {
-        return Err(VmstateValidationError::CorruptData(
-            "cannot detect vmstate layout: IOAPIC base address 0xFEC00000 not found".to_string(),
-        ));
+    let shift = detect_offset_shift(data).map_err(|e| {
+        VmstateValidationError::CorruptData(format!("cannot detect vmstate layout: {}", e))
+    })?;
+    if let Err(e) = validate_core_offsets(data, shift) {
+        return Err(VmstateValidationError::CorruptData(e.to_string()));
     }
 
     // 4. Parse and validate CPUID entries
@@ -69,7 +70,6 @@ pub fn pre_restore_validate(
     }
 
     // 6. Validate memory state is present (check for non-zero RIP)
-    let shift = detect_offset_shift(data).unwrap();
     let rip = r64(data, adj(REF_REGS, shift) + 128);
     if rip == 0 {
         return Err(VmstateValidationError::CorruptData(
@@ -153,12 +153,42 @@ fn adj(reference: usize, shift: isize) -> usize {
     (reference as isize - shift) as usize
 }
 
+fn require_range(data: &[u8], offset: usize, len: usize, label: &str) -> Result<()> {
+    match offset.checked_add(len) {
+        Some(end) if end <= data.len() => Ok(()),
+        _ => bail!(
+            "vmstate too small for {} at offset 0x{:x}: need {} bytes, have {}",
+            label,
+            offset,
+            len,
+            data.len()
+        ),
+    }
+}
+
+fn validate_core_offsets(data: &[u8], shift: isize) -> Result<()> {
+    require_range(
+        data,
+        adj(REF_IOAPIC, shift),
+        24 + 24 * 8,
+        "ioapic redirection table",
+    )?;
+    require_range(data, adj(REF_LAPIC, shift), 1024, "lapic state")?;
+    require_range(data, adj(REF_REGS, shift), 144, "general registers")?;
+    require_range(data, adj(REF_SEGS, shift), 192, "segment registers")?;
+    require_range(data, adj(REF_GDT, shift), 10, "gdt")?;
+    require_range(data, adj(REF_IDT, shift), 10, "idt")?;
+    require_range(data, adj(REF_CR, shift), 32, "control registers")?;
+    require_range(data, adj(REF_EFER, shift), 8, "efer")?;
+    require_range(data, adj(REF_APIC_BASE, shift), 8, "apic base")?;
+    require_range(data, adj(REF_XCRS, shift), 24, "xcrs header")?;
+    require_range(data, adj(REF_XSAVE, shift), 4096, "xsave state")?;
+    Ok(())
+}
+
 pub fn parse_vmstate(data: &[u8]) -> Result<ParsedVmState> {
     let shift = detect_offset_shift(data)?;
-    let efer_off = adj(REF_EFER, shift);
-    if efer_off + 8 > data.len() {
-        bail!("vmstate too small: {} bytes", data.len());
-    }
+    validate_core_offsets(data, shift)?;
 
     Ok(ParsedVmState {
         regs: parse_regs(data, adj(REF_REGS, shift)),
@@ -172,14 +202,22 @@ pub fn parse_vmstate(data: &[u8]) -> Result<ParsedVmState> {
     })
 }
 
+fn read_le_bytes<const N: usize>(d: &[u8], o: usize) -> [u8; N] {
+    let mut bytes = [0u8; N];
+    if let Some(slice) = d.get(o..o + N) {
+        bytes.copy_from_slice(slice);
+    }
+    bytes
+}
+
 fn r64(d: &[u8], o: usize) -> u64 {
-    u64::from_le_bytes(d[o..o + 8].try_into().unwrap())
+    u64::from_le_bytes(read_le_bytes(d, o))
 }
 fn r32(d: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes(d[o..o + 4].try_into().unwrap())
+    u32::from_le_bytes(read_le_bytes(d, o))
 }
 fn r16(d: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes(d[o..o + 2].try_into().unwrap())
+    u16::from_le_bytes(read_le_bytes(d, o))
 }
 
 fn parse_regs(d: &[u8], o: usize) -> kvm_regs {

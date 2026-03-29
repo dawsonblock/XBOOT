@@ -27,14 +27,9 @@ FLAG_STDOUT_TRUNCATED = 1
 FLAG_STDERR_TRUNCATED = 2
 TRUNCATION_MARKER = b"\n[truncated]\n"
 
-# Global flag for timeout detection
-_timed_out = False
-
 
 def timeout_handler(_signum, _frame):
-    """Handle SIGALRM - set flag and raise exception to interrupt execution."""
-    global _timed_out
-    _timed_out = True
+    """Handle SIGALRM by interrupting execution."""
     raise TimeoutError("execution timed out")
 
 
@@ -65,8 +60,6 @@ def main() -> int:
     Returns:
         Exit code (0 for success, 1 for error)
     """
-    global _timed_out
-    
     # Default response values for early errors
     request_id = b"error"
     exit_code = -1
@@ -108,9 +101,7 @@ def main() -> int:
         
         # Apply resource limits BEFORE setting up timeout
         timeout_ms = payload["timeout_ms"]
-        cpu_seconds = max(1, int((timeout_ms + 1999) / 1000))
         limit_failures = apply_limits(
-            cpu_seconds=cpu_seconds,
             memory_bytes=int(limits.get("memory_bytes", 512 * 1024 * 1024)),
             nofile=int(limits.get("nofile", 64)),
             nproc=int(limits.get("nproc", 16)),
@@ -118,7 +109,6 @@ def main() -> int:
         )
         
         # Set up timeout handler
-        _timed_out = False
         signal.signal(signal.SIGALRM, timeout_handler)
         signal.setitimer(signal.ITIMER_REAL, timeout_ms / 1000.0)
         

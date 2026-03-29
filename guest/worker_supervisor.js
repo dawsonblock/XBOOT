@@ -60,12 +60,18 @@ function parseChildResponse(data) {
   const requestIdLen = parseInt(header[1], 10);
   const stdoutLen = parseInt(header[4], 10);
   const stderrLen = parseInt(header[5], 10);
-  const payload = data.subarray(newlineIndex + 1 + requestIdLen);
+  const payload = data.subarray(newlineIndex + 1);
+  const expected = requestIdLen + stdoutLen + stderrLen;
+  if (payload.length < expected) throw new Error('truncated child response payload');
+  if (payload.length !== expected) throw new Error('unexpected trailing bytes in child response payload');
+  const requestId = payload.subarray(0, requestIdLen);
+  if (requestId.length === 0) throw new Error('missing child request id');
+  const body = payload.subarray(requestIdLen);
   return [
     parseInt(header[2], 10),
     header[3],
-    payload.subarray(0, stdoutLen),
-    payload.subarray(stdoutLen, stdoutLen + stderrLen),
+    body.subarray(0, stdoutLen),
+    body.subarray(stdoutLen, stdoutLen + stderrLen),
     parseInt(header[6], 10),
   ];
 }
@@ -88,27 +94,9 @@ function minimalChildEnv() {
   return env;
 }
 
-function limitProfile() {
-  const value = String(process.env.ZEROBOOT_CHILD_LIMIT_PROFILE || 'guest').trim().toLowerCase();
-  return value || 'guest';
-}
-
-function childCommand(timeoutMs) {
+function childCommand() {
   const childScript = process.env.ZEROBOOT_CHILD_SCRIPT || '/zeroboot/worker_child.js';
-  const cpuSeconds = Math.max(1, Math.ceil((timeoutMs + 1999) / 1000));
-  const memoryKiB = Math.max(1, Math.floor(CHILD_MEMORY_BYTES / 1024));
-  const fileKiB = Math.max(1, Math.floor(CHILD_FSIZE_BYTES / 1024));
-  const shell = [
-    `ulimit -t ${cpuSeconds}`,
-    `ulimit -n ${CHILD_NOFILE}`,
-    `ulimit -f ${fileKiB}`,
-  ];
-  if (limitProfile() !== 'compat') {
-    shell.push(`ulimit -v ${memoryKiB}`);
-    shell.push(`ulimit -u ${CHILD_NPROC}`);
-  }
-  shell.push(`exec "${process.execPath}" "${childScript}"`);
-  return ['/bin/sh', ['-c', shell.join('; ')]];
+  return [process.execPath, [childScript]];
 }
 
 function spawnChildExecutor(requestId, timeoutMs, code, stdinData) {
@@ -128,7 +116,7 @@ function spawnChildExecutor(requestId, timeoutMs, code, stdinData) {
     },
   }), 'utf8');
 
-  const [command, args] = childCommand(timeoutMs);
+  const [command, args] = childCommand();
   const result = spawnSync(command, args, {
     input: payload,
     env: minimalChildEnv(),

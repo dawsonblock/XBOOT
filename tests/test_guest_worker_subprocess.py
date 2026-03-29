@@ -33,12 +33,14 @@ class GuestWorkerSubprocessTests(unittest.TestCase):
         code: str,
         *,
         stdin: str = "",
+        timeout_ms: int = 2000,
+        profile: str = "compat",
         limits: Optional[dict] = None,
         raw_input: Optional[bytes] = None,
     ):
         payload = {
             "request_id": "t1",
-            "timeout_ms": 2000,
+            "timeout_ms": timeout_ms,
             "code": code,
             "stdin": stdin,
             "limits": limits
@@ -57,7 +59,7 @@ class GuestWorkerSubprocessTests(unittest.TestCase):
             input=raw_input if raw_input is not None else json.dumps(payload).encode("utf-8"),
             capture_output=True,
             timeout=5,
-            env={**os.environ, "ZEROBOOT_CHILD_LIMIT_PROFILE": "compat"},
+            env={**os.environ, "ZEROBOOT_CHILD_LIMIT_PROFILE": profile},
         )
         self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
         return parse_response(proc.stdout)
@@ -150,6 +152,60 @@ class GuestWorkerSubprocessTests(unittest.TestCase):
         self.assertEqual(error_type, "ok")
         self.assertEqual(stdout.strip(), b"alive")
         self.assertNotIn(b"killed", stderr.lower())
+
+    def test_child_compat_profile_small_timeout_is_framed(self):
+        _request_id, exit_code, error_type, _stdout, stderr, _flags = self.run_child(
+            "while True: pass",
+            timeout_ms=50,
+            profile="compat",
+        )
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(error_type, "timeout")
+        self.assertIn(b"timed out", stderr)
+
+    def test_child_guest_profile_small_timeout_is_framed(self):
+        _request_id, exit_code, error_type, _stdout, stderr, _flags = self.run_child(
+            "while True: pass",
+            timeout_ms=50,
+            profile="guest",
+        )
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(error_type, "timeout")
+        self.assertIn(b"timed out", stderr)
+
+    def test_child_system_exit_is_framed_runtime_error(self):
+        _request_id, exit_code, error_type, _stdout, stderr, _flags = self.run_child(
+            "raise SystemExit(3)"
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(error_type, "runtime")
+        self.assertIn(b"SystemExit: 3", stderr)
+
+    def test_child_many_temp_files_still_frames_response(self):
+        code = (
+            "import os\n"
+            "tmp = os.environ['ZEROBOOT_TMPDIR']\n"
+            "for i in range(32):\n"
+            "    with open(os.path.join(tmp, f'f{i}.txt'), 'w', encoding='utf-8') as handle:\n"
+            "        handle.write('x' * 16)\n"
+            "print(len(os.listdir(tmp)))\n"
+        )
+        _request_id, exit_code, error_type, stdout, stderr, _flags = self.run_child(
+            code,
+            limits={
+                "stdout_bytes": 1024,
+                "stderr_bytes": 1024,
+                "tmp_bytes": 16 * 1024,
+                "memory_bytes": 256 * 1024 * 1024,
+                "nofile": 32,
+                "nproc": 8,
+                "fsize_bytes": 4096,
+            },
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(error_type, "ok")
+        self.assertEqual(stdout.strip(), b"32")
+        self.assertEqual(stderr, b"")
 
 
 if __name__ == "__main__":

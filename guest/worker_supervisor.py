@@ -87,9 +87,11 @@ def parse_child_response(data: bytes):
     flags = int(header[6])
 
     payload = data[newline + 1 :]
-    minimum = request_id_len + stdout_len + stderr_len
-    if len(payload) < minimum:
+    expected = request_id_len + stdout_len + stderr_len
+    if len(payload) < expected:
         raise ValueError("truncated child response payload")
+    if len(payload) != expected:
+        raise ValueError("unexpected trailing bytes in child response payload")
 
     request_id = payload[:request_id_len]
     body = payload[request_id_len:]

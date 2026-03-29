@@ -157,3 +157,4 @@ The `/v1/metrics` endpoint exposes Prometheus metrics including:
 - no warm VM pool yet (experimental)
 - the KVM CI lane requires a real Ubuntu 22.04 x86_64 self-hosted runner with `/dev/kvm`
 - not proven for hostile public multitenancy
+- do not expose the current release as a public arbitrary-code execution service

@@ -80,17 +80,19 @@ In **Prod mode**, the server enforces strict security requirements:
 
 ### Guest Isolation Model
 
-The guest execution model provides strong isolation between requests:
+The guest execution model uses a fresh per-request child process inside one guest VM:
 
 1. **Supervisor Process**: A long-lived process that manages request queuing
 2. **Child Executor**: For each request, a fresh child process is spawned to execute code
-3. **Process Exit**: The child process exits after each request, ensuring no state bleeds
+3. **Process Exit**: The child process exits after each request to prevent normal interpreter state bleed
 
-This subprocess-based model ensures:
+This subprocess-based model provides:
 - No persistent Python/Node.js state between requests
 - Per-request scratch filesystem area with no persistent on-disk state between requests
-- Memory isolation between executions
+- A fresh process boundary for each execution inside the guest
 - Automatic cleanup on timeout or error
+
+This model is designed to contain normal request-to-request state bleed. It is not positioned as a hostile public multitenant isolation boundary by itself.
 
 ### Key Features
 

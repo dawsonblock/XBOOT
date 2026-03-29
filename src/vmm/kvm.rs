@@ -181,7 +181,8 @@ impl ForkedVm {
 
         // Restore MSRs (kvm-clock, syscall, etc.)
         if !snapshot.msrs.is_empty() {
-            let mut msrs = Msrs::new(snapshot.msrs.len()).unwrap();
+            let mut msrs = Msrs::new(snapshot.msrs.len())
+                .map_err(|e| anyhow::anyhow!("Msrs::new({}): {:?}", snapshot.msrs.len(), e))?;
             for (i, entry) in snapshot.msrs.iter().enumerate() {
                 let mut e = *entry;
                 if e.index == 0x4b564d00 {
@@ -532,7 +533,8 @@ impl Drop for ForkedVm {
 }
 
 pub fn create_snapshot_memfd(mem_ptr: *const u8, mem_size: usize) -> Result<i32> {
-    let name = std::ffi::CString::new("zeroboot-snapshot").unwrap();
+    let name = std::ffi::CString::new("zeroboot-snapshot")
+        .map_err(|e| anyhow::anyhow!("invalid memfd name: {}", e))?;
     let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         bail!("memfd_create failed");

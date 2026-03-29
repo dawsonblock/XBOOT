@@ -19,7 +19,6 @@ def limit_profile() -> str:
 
 
 def apply_limits(
-    cpu_seconds: int,
     memory_bytes: int,
     nofile: int = 64,
     nproc: int = 16,
@@ -28,7 +27,6 @@ def apply_limits(
     """Apply resource limits to the current process.
     
     Args:
-        cpu_seconds: CPU time limit in seconds
         memory_bytes: Memory limit in bytes (address space)
         nofile: Maximum number of open file descriptors
         nproc: Maximum number of processes
@@ -58,9 +56,6 @@ def apply_limits(
             resource.setrlimit(kind, (target_soft, target))
         except (ValueError, OSError) as exc:
             failures.append(f"{kind}:{exc}")
-    
-    # CPU time limit
-    clamp_and_set(resource.RLIMIT_CPU, max(1, cpu_seconds))
     
     # Memory limit (address space) - skip in compat mode
     if profile != "compat" and hasattr(resource, "RLIMIT_AS"):

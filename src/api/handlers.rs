@@ -325,7 +325,10 @@ impl Metrics {
     }
 
     fn record_language_outcome(&self, language: &str, outcome: &str) {
-        let mut counters = self.language_counters.lock().unwrap();
+        let mut counters = match self.language_counters.lock() {
+            Ok(counters) => counters,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let entry = counters.entry(language.to_string()).or_default();
         match outcome {
             "ok" => entry.ok += 1,
@@ -427,7 +430,10 @@ fn check_rate_limit(
     } else {
         (100.0, 100.0)
     };
-    let mut limiters = state.rate_limiters.lock().unwrap();
+    let mut limiters = match state.rate_limiters.lock() {
+        Ok(limiters) => limiters,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     let bucket = limiters
         .entry(bucket_key)
         .or_insert_with(|| TokenBucket::with_capacity(rate, capacity));
@@ -453,7 +459,7 @@ const REQUEST_LOG_DEFAULT_CODE_REDACTION: &str = "[redacted]";
 fn iso_now() -> String {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap();
+        .unwrap_or_default();
     let secs = d.as_secs();
     let millis = d.subsec_millis();
     let days = secs / 86400;
@@ -896,12 +902,25 @@ pub async fn exec_handler(
     let masked_key = mask_api_key(&api_key);
     let req_for_log = req.clone();
     let state_for_task = state.clone();
-    let response = tokio::task::spawn_blocking(move || {
+    let response = match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         execute_code_internal(&state_for_task, &req, &rid, ExecutionMode::User)
     })
     .await
-    .unwrap();
+    {
+        Ok(response) => response,
+        Err(e) => {
+            state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
+            error_response(
+                &request_id,
+                format!("Execution task failed: {}", e),
+                "internal",
+                Instant::now(),
+                0.0,
+                0.0,
+            )
+        }
+    };
 
     log_request(
         &state,
@@ -1136,20 +1155,37 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthRe
     };
 
     let ttl = Duration::from_secs(state.config.health.cache_ttl_secs.max(1));
-    if let Some(cached) = state.health_cache.lock().unwrap().clone() {
+    let cached = match state.health_cache.lock() {
+        Ok(cache) => cache.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if let Some(cached) = cached {
         if cached.generated_at.elapsed() < ttl {
             return Json(cached.response);
         }
     }
 
     let state_for_task = state.clone();
-    let response = tokio::task::spawn_blocking(move || {
+    let response = match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         probe_all_templates(&state_for_task)
     })
     .await
-    .unwrap();
-    *state.health_cache.lock().unwrap() = Some(CachedHealthState {
+    {
+        Ok(response) => response,
+        Err(e) => {
+            return Json(HealthResponse {
+                status: "unavailable".into(),
+                templates: Default::default(),
+                error: Some(format!("health probe task failed: {}", e)),
+            });
+        }
+    };
+    let mut cache = match state.health_cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *cache = Some(CachedHealthState {
         generated_at: Instant::now(),
         response: response.clone(),
     });
@@ -1378,7 +1414,10 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
             if status.ready { 1 } else { 0 }
         ));
     }
-    let counters = m.language_counters.lock().unwrap();
+    let counters = match m.language_counters.lock() {
+        Ok(counters) => counters,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     for (language, stats) in counters.iter() {
         out.push_str(&format!(
             "# TYPE zeroboot_language_executions_total counter\nzeroboot_language_executions_total{{language=\"{}\",result=\"ok\"}} {}\nzeroboot_language_executions_total{{language=\"{}\",result=\"error\"}} {}\nzeroboot_language_executions_total{{language=\"{}\",result=\"timeout\"}} {}\n",

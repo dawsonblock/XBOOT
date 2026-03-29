@@ -59,6 +59,12 @@ These are enforced server-side. Defaults can be changed with environment variabl
 - `transport`
 - `internal`
 
+Worker-path mapping rules:
+
+- `timeout`: the child wall timer fired or the supervisor timed out waiting on the child process
+- `protocol`: the child emitted a malformed framed reply
+- `internal`: child spawn failure, child signal death, or another unexpected host-side fault
+
 If a template was quarantined at startup, execution now returns a validation error with the quarantine detail instead of a vague missing-template error.
 
 ## POST /v1/exec/batch

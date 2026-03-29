@@ -141,6 +141,23 @@ class NodeWorkerProtocolTests(unittest.TestCase):
         self.assertEqual(error_type, "protocol")
         self.assertIn("malformed child response", stderr)
 
+    def test_node_supervisor_trailing_child_payload_is_protocol(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child = Path(tmp) / "extra_bytes_child.js"
+            child.write_text(
+                "process.stdout.write('WRK1R 2 0 ok 1 0 0\\n');\n"
+                "process.stdout.write('n1xextra');\n",
+                encoding="utf-8",
+            )
+            rid, exit_code, error_type, _stdout, stderr, _flags = self.run_worker(
+                "console.log('ignored')",
+                child_script=child,
+            )
+        self.assertEqual(rid, b"n1")
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(error_type, "protocol")
+        self.assertIn("unexpected trailing bytes", stderr)
+
     def test_node_supervisor_raw_signal_is_internal(self):
         with tempfile.TemporaryDirectory() as tmp:
             child = Path(tmp) / "sigkill_child.js"

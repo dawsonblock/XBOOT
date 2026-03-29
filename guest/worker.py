@@ -1,3 +1,9 @@
+"""Legacy in-process worker kept for compatibility and comparison.
+
+The current per-request subprocess execution path uses worker_supervisor.py
+and worker_child.py instead of this entrypoint.
+"""
+
 import builtins
 import contextlib
 import gc

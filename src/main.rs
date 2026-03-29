@@ -680,7 +680,9 @@ fn cmd_serve(args: &[String]) -> Result<()> {
             .with_state(state);
 
         let bind_target = format!("{}:{}", bind_addr, port);
-        let listener = tokio::net::TcpListener::bind(&bind_target).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(&bind_target)
+            .await
+            .with_context(|| format!("failed to bind API listener on {}", bind_target))?;
         eprintln!("Zeroboot API server listening on {}", bind_target);
         axum::serve(
             listener,
@@ -688,9 +690,10 @@ fn cmd_serve(args: &[String]) -> Result<()> {
         )
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .unwrap();
+        .context("API server failed while serving requests")?;
         eprintln!("Server shutdown complete");
-    });
+        Ok::<(), anyhow::Error>(())
+    })?;
     Ok(())
 }
 
