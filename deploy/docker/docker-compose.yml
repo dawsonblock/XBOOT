@@ -1,0 +1,163 @@
+version: '3.8'
+
+# XBOOT Docker Compose Configuration
+# Phase B - Docker packaging for local development and testing
+#
+# Prerequisites:
+# - Docker with KVM support (docker run --device /dev/kvm ...)
+# - Templates built and available at ./work/python and ./work/node
+# - Secrets configured in .env file
+#
+# Usage:
+#   docker compose -f deploy/docker/docker-compose.yml up
+#   docker compose -f deploy/docker/docker-compose.yml down
+
+services:
+  xboot:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.runtime
+      args:
+        FIRECRACKER_VERSION: 1.12.0
+    image: xboot-runtime:latest
+    container_name: xboot
+    
+    # Privileged mode required for KVM access and cgroup management
+    # This is expected for infrastructure workloads like XBOOT
+    privileged: true
+    
+    # Device access for KVM
+    devices:
+      - /dev/kvm:/dev/kvm
+    
+    # Use host cgroup namespace for proper cgroup v2 support
+    cgroup: host
+    
+    # Network configuration
+    ports:
+      - "${XBOOT_PORT:-8080}:8080"
+    
+    # Volume mounts
+    volumes:
+      # Release tree (read-only) - contains zeroboot binary
+      - type: bind
+        source: ../../target/release
+        target: /var/lib/zeroboot/current/bin
+        read_only: true
+        bind:
+          create_host_path: false
+      
+      # Python template (read-only)
+      - type: bind
+        source: ../../work/python
+        target: /var/lib/zeroboot/current/templates/python
+        read_only: true
+        bind:
+          create_host_path: false
+      
+      # Node.js template (read-only)
+      - type: bind
+        source: ../../work/node
+        target: /var/lib/zeroboot/current/templates/node
+        read_only: true
+        bind:
+          create_host_path: false
+      
+      # Secrets (read-only)
+      - type: bind
+        source: ${XBOOT_SECRETS_DIR:-./secrets}
+        target: /etc/zeroboot
+        read_only: true
+        bind:
+          create_host_path: true
+      
+      # Writable state (logs, runtime data)
+      - type: bind
+        source: ${XBOOT_STATE_DIR:-./state}
+        target: /var/lib/zeroboot
+        bind:
+          create_host_path: true
+    
+    # Environment variables
+    environment:
+      # Core configuration
+      - ZEROBOOT_AUTH_MODE=${ZEROBOOT_AUTH_MODE:-prod}
+      - ZEROBOOT_API_KEYS_FILE=/etc/zeroboot/api_keys.json
+      - ZEROBOOT_API_KEY_PEPPER_FILE=/etc/zeroboot/pepper
+      - ZEROBOOT_REQUEST_LOG_PATH=/var/lib/zeroboot/requests.jsonl
+      - ZEROBOOT_LOG_CODE=${ZEROBOOT_LOG_CODE:-false}
+      
+      # Security settings
+      - ZEROBOOT_REQUIRE_TEMPLATE_HASHES=${ZEROBOOT_REQUIRE_TEMPLATE_HASHES:-true}
+      - ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=${ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES:-false}
+      - ZEROBOOT_TRUSTED_PROXIES=${ZEROBOOT_TRUSTED_PROXIES:-}
+      
+      # Firecracker version pinning
+      - ZEROBOOT_ALLOWED_FIRECRACKER_VERSION=${ZEROBOOT_ALLOWED_FIRECRACKER_VERSION:-1.12.0}
+      - ZEROBOOT_ALLOWED_FC_BINARY_SHA256=${ZEROBOOT_ALLOWED_FC_BINARY_SHA256:-}
+      
+      # Operational settings
+      - ZEROBOOT_HEALTH_CACHE_TTL_SECS=${ZEROBOOT_HEALTH_CACHE_TTL_SECS:-10}
+      - ZEROBOOT_MIN_FREE_BYTES=${ZEROBOOT_MIN_FREE_BYTES:-536870912}
+      - ZEROBOOT_MIN_FREE_INODES=${ZEROBOOT_MIN_FREE_INODES:-10000}
+      
+      # Request limits
+      - ZEROBOOT_MAX_REQUEST_BODY_BYTES=${ZEROBOOT_MAX_REQUEST_BODY_BYTES:-262144}
+      - ZEROBOOT_MAX_CODE_BYTES=${ZEROBOOT_MAX_CODE_BYTES:-131072}
+      - ZEROBOOT_MAX_TIMEOUT_SECS=${ZEROBOOT_MAX_TIMEOUT_SECS:-30}
+      - ZEROBOOT_MAX_CONCURRENT_REQUESTS=${ZEROBOOT_MAX_CONCURRENT_REQUESTS:-32}
+      
+      # Template configuration
+      - TEMPLATE_DIRS=python:/var/lib/zeroboot/current/templates/python,node:/var/lib/zeroboot/current/templates/node
+      - RELEASE_ROOT=/var/lib/zeroboot/current
+      - VERIFY_ON_STARTUP=${VERIFY_ON_STARTUP:-true}
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Resource limits (adjust based on host capacity)
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+        labels: "service.name=xboot"
+
+# Optional: Metrics/monitoring stack (commented out by default)
+# Uncomment to enable Prometheus metrics collection
+#
+#  prometheus:
+#    image: prom/prometheus:latest
+#    volumes:
+#      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+#    ports:
+#      - "9090:9090"
+#    depends_on:
+#      - xboot
+#
+#  grafana:
+#    image: grafana/grafana:latest
+#    volumes:
+#      - ./grafana-dashboard.json:/var/lib/grafana/dashboards/dashboard.json:ro
+#    ports:
+#      - "3000:3000"
+#    environment:
+#      - GF_SECURITY_ADMIN_PASSWORD=admin
+#    depends_on:
+#      - prometheus

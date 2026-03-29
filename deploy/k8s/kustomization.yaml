@@ -1,0 +1,75 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+metadata:
+  name: xboot
+
+namespace: xboot
+
+# Resources to include
+resources:
+- namespace.yaml
+- secret-example.yaml
+- pvc-release.yaml
+- pvc-state.yaml
+- deployment.yaml  # Use deployment.yaml or daemonset.yaml, not both
+- service.yaml
+- networkpolicy.yaml
+
+# Common labels for all resources
+commonLabels:
+  app.kubernetes.io/name: xboot
+  app.kubernetes.io/part-of: xboot
+  app.kubernetes.io/managed-by: kustomize
+
+# Common annotations
+commonAnnotations:
+  deployment.timestamp: "${DEPLOYMENT_TIMESTAMP}"
+  deployment.git-commit: "${GIT_COMMIT}"
+
+# Images to use
+images:
+- name: xboot-runtime
+  newTag: "${VERSION:-latest}"
+
+# ConfigMap for non-secret configuration
+generatorOptions:
+  disableNameSuffixHash: false
+
+# ConfigMap with environment-specific settings
+configMapGenerator:
+- name: xboot-config
+  literals:
+  - ZEROBOOT_AUTH_MODE=prod
+  - ZEROBOOT_LOG_CODE=false
+  - ZEROBOOT_REQUIRE_TEMPLATE_HASHES=true
+  - ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=false
+  - ZEROBOOT_ALLOWED_FIRECRACKER_VERSION=1.12.0
+  - ZEROBOOT_HEALTH_CACHE_TTL_SECS=10
+  - ZEROBOOT_MIN_FREE_BYTES=536870912
+  - ZEROBOOT_MIN_FREE_INODES=10000
+  - ZEROBOOT_MAX_REQUEST_BODY_BYTES=262144
+  - ZEROBOOT_MAX_CODE_BYTES=131072
+  - ZEROBOOT_MAX_TIMEOUT_SECS=30
+  - ZEROBOOT_MAX_CONCURRENT_REQUESTS=32
+
+# Secret references (actual secrets managed separately)
+# Use external-secrets or sealed-secrets for production
+
+# Patches for environment-specific customizations
+# Uncomment and customize for your environment, or create patch files
+# patchesStrategicMerge:
+# - patches/replicas.yaml
+# - patches/resources.yaml
+# - patches/node-selector.yaml
+
+# JSON patches for specific modifications
+# patchesJson6902:
+# - target:
+#     version: v1
+#     kind: Service
+#     name: xboot
+#   patch: |
+#     - op: replace
+#       path: /spec/type
+#       value: LoadBalancer

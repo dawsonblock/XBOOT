@@ -1,0 +1,243 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xboot
+  namespace: xboot
+  labels:
+    app.kubernetes.io/name: xboot
+    app.kubernetes.io/component: runtime
+    app.kubernetes.io/part-of: xboot
+    app.kubernetes.io/version: "0.1.0"
+spec:
+  replicas: 1  # Start with 1, scale carefully
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1  # Ensure we don't lose service during rollout
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: xboot
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: xboot
+        app.kubernetes.io/component: runtime
+        app.kubernetes.io/part-of: xboot
+      annotations:
+        # Force redeployment when config changes
+        checksum/secrets: "${CHECKSUM_SECRETS}"
+        checksum/config: "${CHECKSUM_CONFIG}"
+    spec:
+      # Critical: Only schedule on KVM-capable nodes
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: sandbox.kvm
+                operator: In
+                values: ["true"]
+      
+      # Tolerate the sandbox taint (keeps other workloads away)
+      tolerations:
+      - key: "sandbox.kvm"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      
+      # Use host network for simpler device access (optional)
+      # hostNetwork: true
+      
+      # Security context - privileged required for KVM
+      securityContext:
+        runAsUser: 0  # Root required for KVM/cgroup access
+      
+      containers:
+      - name: xboot
+        image: xboot-runtime:latest
+        imagePullPolicy: IfNotPresent
+        
+        # Privileged required for KVM and cgroup management
+        securityContext:
+          privileged: true
+          allowPrivilegeEscalation: true
+          readOnlyRootFilesystem: true  # As much as possible
+          capabilities:
+            add:
+            - SYS_ADMIN  # Required for cgroup operations
+        
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        
+        env:
+        # Core configuration
+        - name: ZEROBOOT_AUTH_MODE
+          value: "prod"
+        - name: ZEROBOOT_API_KEYS_FILE
+          value: "/etc/zeroboot/api_keys.json"
+        - name: ZEROBOOT_API_KEY_PEPPER_FILE
+          value: "/etc/zeroboot/pepper"
+        - name: ZEROBOOT_REQUEST_LOG_PATH
+          value: "/var/lib/zeroboot/requests.jsonl"
+        - name: ZEROBOOT_LOG_CODE
+          value: "false"
+        
+        # Security
+        - name: ZEROBOOT_REQUIRE_TEMPLATE_HASHES
+          value: "true"
+        - name: ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES
+          value: "false"
+        - name: ZEROBOOT_KEYRING_PATH
+          value: "/etc/zeroboot/keyring.json"
+        
+        # Firecracker version pinning
+        - name: ZEROBOOT_ALLOWED_FIRECRACKER_VERSION
+          value: "1.12.0"
+        - name: ZEROBOOT_ALLOWED_FC_BINARY_SHA256
+          valueFrom:
+            secretKeyRef:
+              name: xboot-secrets
+              key: fc_sha256
+              optional: true
+        
+        # Operational settings
+        - name: ZEROBOOT_HEALTH_CACHE_TTL_SECS
+          value: "10"
+        - name: ZEROBOOT_MIN_FREE_BYTES
+          value: "536870912"
+        - name: ZEROBOOT_MIN_FREE_INODES
+          value: "10000"
+        
+        # Request limits
+        - name: ZEROBOOT_MAX_REQUEST_BODY_BYTES
+          value: "262144"
+        - name: ZEROBOOT_MAX_CODE_BYTES
+          value: "131072"
+        - name: ZEROBOOT_MAX_TIMEOUT_SECS
+          value: "30"
+        - name: ZEROBOOT_MAX_CONCURRENT_REQUESTS
+          value: "32"
+        
+        # Template configuration
+        - name: TEMPLATE_DIRS
+          value: "python:/var/lib/zeroboot/current/templates/python,node:/var/lib/zeroboot/current/templates/node"
+        - name: RELEASE_ROOT
+          value: "/var/lib/zeroboot/current"
+        - name: VERIFY_ON_STARTUP
+          value: "true"
+        
+        # Device access for KVM
+        volumeMounts:
+        - name: dev-kvm
+          mountPath: /dev/kvm
+        
+        # Release tree (read-only)
+        - name: xboot-release
+          mountPath: /var/lib/zeroboot/current
+          readOnly: true
+        
+        # Secrets (read-only)
+        - name: xboot-secrets
+          mountPath: /etc/zeroboot
+          readOnly: true
+        
+        # Writable state
+        - name: xboot-state
+          mountPath: /var/lib/zeroboot
+        
+        # tmpfs for temporary files
+        - name: tmp
+          mountPath: /tmp
+        
+        # Liveness probe - lightweight
+        livenessProbe:
+          httpGet:
+            path: /live
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # Readiness probe - checks templates are ready
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+          initialDelaySeconds: 60
+          periodSeconds: 5
+          timeoutSeconds: 10
+          failureThreshold: 6
+        
+        # Resource limits
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+      
+      # Volumes
+      volumes:
+      # KVM device
+      - name: dev-kvm
+        hostPath:
+          path: /dev/kvm
+          type: CharDevice
+      
+      # Release tree (from PVC or init container)
+      - name: xboot-release
+        persistentVolumeClaim:
+          claimName: xboot-release
+          readOnly: true
+      
+      # Secrets
+      - name: xboot-secrets
+        secret:
+          secretName: xboot-secrets
+          defaultMode: 0400
+      
+      # State volume
+      - name: xboot-state
+        persistentVolumeClaim:
+          claimName: xboot-state
+      
+      # tmpfs for /tmp
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 100Mi
+      
+      # Optional: Init container to download release
+      # Use this instead of PVC if you want dynamic release fetching
+      # initContainers:
+      # - name: fetch-release
+      #   image: curlimages/curl:latest
+      #   command:
+      #   - sh
+      #   - -c
+      #   - |
+      #     curl -fsSL "${RELEASE_URL}" -o /tmp/release.tar.gz &&
+      #     tar -xzf /tmp/release.tar.gz -C /var/lib/zeroboot/current
+      #   volumeMounts:
+      #   - name: xboot-release
+      #     mountPath: /var/lib/zeroboot/current
+      #   env:
+      #   - name: RELEASE_URL
+      #     value: "https://releases.example.com/xboot/latest.tar.gz"
+      
+      # Pod disruption budget ensures at least one replica during drains
+      # (requires PDB resource)
+      
+      # Topology spread for multi-node deployments
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: xboot

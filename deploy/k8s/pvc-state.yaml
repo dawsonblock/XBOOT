@@ -1,0 +1,58 @@
+# XBOOT State Volume
+# 
+# This PVC holds mutable runtime state:
+# - Request logs (requests.jsonl)
+# - Runtime scratch data
+# - Temporary files
+#
+# Each pod needs its own writable state, so this uses ReadWriteOnce.
+# For DaemonSet deployments, use emptyDir or local storage instead.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: xboot-state
+  namespace: xboot
+  labels:
+    app.kubernetes.io/name: xboot
+    app.kubernetes.io/component: state
+    app.kubernetes.io/part-of: xboot
+spec:
+  accessModes:
+    - ReadWriteOnce  # Only one pod can write
+  resources:
+    requests:
+      storage: 10Gi  # Adjust based on log retention needs
+  storageClassName: standard  # Change to your storage class
+
+---
+# Alternative: StatefulSet with volumeClaimTemplates
+#
+# Use this for multiple replicas, each with their own state volume:
+#
+# apiVersion: apps/v1
+# kind: StatefulSet
+# metadata:
+#   name: xboot
+# spec:
+#   serviceName: xboot
+#   replicas: 3
+#   volumeClaimTemplates:
+#   - metadata:
+#       name: xboot-state
+#     spec:
+#       accessModes: ["ReadWriteOnce"]
+#       resources:
+#         requests:
+#           storage: 10Gi
+
+---
+# Alternative: emptyDir for ephemeral state
+#
+# If you don't need persistent logs, use emptyDir in the deployment
+# instead of a PVC. This is simpler but logs are lost on pod restart.
+#
+# volumes:
+#   - name: xboot-state
+#     emptyDir:
+#       sizeLimit: 10Gi

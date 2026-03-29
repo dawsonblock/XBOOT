@@ -1,0 +1,91 @@
+# XBOOT Runtime Docker Image
+# Phase B - Docker packaging for the zeroboot runtime
+#
+# This image packages the zeroboot binary and firecracker runtime
+# Templates are NOT built inside this image - they are mounted at runtime
+#
+# Build: docker build -f deploy/docker/Dockerfile.runtime -t xboot-runtime .
+# Run: docker run --device /dev/kvm --privileged xboot-runtime
+
+FROM ubuntu:22.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    jq \
+    python3 \
+    python3-pip \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Firecracker 1.12.0
+# Pin to exact version for security and reproducibility
+ARG FIRECRACKER_VERSION=1.12.0
+ARG FIRECRACKER_SHA256=f048e3308f9007e1f9e8f71a95c05f7e8d09c9e6a8f42b25c3bfa3b5e5e8e7d6
+
+RUN curl -fsSL \
+    "https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz" \
+    -o /tmp/firecracker.tgz \
+    && echo "${FIRECRACKER_SHA256}  /tmp/firecracker.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/firecracker.tgz -C /tmp \
+    && mv "/tmp/firecracker-v${FIRECRACKER_VERSION}-x86_64/firecracker-v${FIRECRACKER_VERSION}-x86_64" /usr/local/bin/firecracker \
+    && chmod +x /usr/local/bin/firecracker \
+    && rm -rf /tmp/firecracker*
+
+# Create runtime directories
+RUN mkdir -p /var/lib/zeroboot/current/bin \
+    /var/lib/zeroboot/current/templates \
+    /var/lib/zeroboot/requests \
+    /etc/zeroboot \
+    /opt/xboot
+
+# Copy zeroboot binary from build context
+# This expects the binary to be built before running docker build
+COPY target/release/zeroboot /var/lib/zeroboot/current/bin/zeroboot
+RUN chmod +x /var/lib/zeroboot/current/bin/zeroboot
+
+# Copy entrypoint script
+COPY deploy/docker/docker-entrypoint.sh /opt/xboot/entrypoint.sh
+RUN chmod +x /opt/xboot/entrypoint.sh
+
+# Create non-root user for running zeroboot (optional, can be overridden)
+RUN groupadd -r kvm || true \
+    && useradd -r -s /bin/false -g kvm zeroboot || true
+
+# Set environment defaults
+ENV ZEROBOOT_AUTH_MODE=prod \
+    ZEROBOOT_API_KEYS_FILE=/etc/zeroboot/api_keys.json \
+    ZEROBOOT_API_KEY_PEPPER_FILE=/etc/zeroboot/pepper \
+    ZEROBOOT_REQUEST_LOG_PATH=/var/lib/zeroboot/requests.jsonl \
+    ZEROBOOT_LOG_CODE=false \
+    ZEROBOOT_REQUIRE_TEMPLATE_HASHES=true \
+    ZEROBOOT_REQUIRE_TEMPLATE_SIGNATURES=false \
+    ZEROBOOT_ALLOWED_FIRECRACKER_VERSION=1.12.0 \
+    ZEROBOOT_HEALTH_CACHE_TTL_SECS=10 \
+    ZEROBOOT_MIN_FREE_BYTES=536870912 \
+    ZEROBOOT_MIN_FREE_INODES=10000 \
+    PATH="/usr/local/bin:/var/lib/zeroboot/current/bin:${PATH}"
+
+# Expose the zeroboot API port
+EXPOSE 8080
+
+# Health check (lightweight /live probe)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/live || exit 1
+
+# Use custom entrypoint
+ENTRYPOINT ["/opt/xboot/entrypoint.sh"]
+
+# Default command: serve with templates mounted
+CMD ["serve", "python:/var/lib/zeroboot/current/templates/python,node:/var/lib/zeroboot/current/templates/node", "8080"]
+
+# Labels for metadata
+LABEL \
+    org.opencontainers.image.title="XBOOT Runtime" \
+    org.opencontainers.image.description="Controlled-internal snapshot-forked KVM sandboxes" \
+    org.opencontainers.image.version="0.1.0" \
+    firecracker.version="1.12.0"

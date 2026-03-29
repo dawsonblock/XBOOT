@@ -1,0 +1,74 @@
+# XBOOT Release Volume
+# 
+# This PVC holds the release tree:
+# - bin/zeroboot (the binary)
+# - templates/python/ (Python template)
+# - templates/node/ (Node.js template)
+# - release-receipt.json (manifest)
+#
+# Options:
+# 1. Use a pre-provisioned PV with the release tree
+# 2. Use a CSI driver that supports read-only snapshots
+# 3. Mount from a sidecar/init container that downloads the release
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: xboot-release
+  namespace: xboot
+  labels:
+    app.kubernetes.io/name: xboot
+    app.kubernetes.io/component: release
+    app.kubernetes.io/part-of: xboot
+spec:
+  accessModes:
+    - ReadOnlyMany  # Multiple pods can read the same release
+  resources:
+    requests:
+      storage: 5Gi  # Adjust based on template sizes
+  storageClassName: standard  # Change to your storage class
+  # If using pre-provisioned PV:
+  # volumeName: xboot-release-pv
+
+---
+# Alternative: Pre-provisioned PV for node-local storage
+# 
+# Use this when you want to mount a directory from the KVM node
+# that already contains the release tree.
+#
+# 1. Create the directory on each node:
+#    mkdir -p /var/lib/zeroboot/current
+#    # Copy release tree here
+#
+# 2. Create the PV:
+#    kubectl apply -f - <<EOF
+#    apiVersion: v1
+#    kind: PersistentVolume
+#    metadata:
+#      name: xboot-release-pv
+#    spec:
+#      capacity:
+#        storage: 5Gi
+#      accessModes:
+#        - ReadOnlyMany
+#      persistentVolumeReclaimPolicy: Retain
+#      storageClassName: local-storage
+#      local:
+#        path: /var/lib/zeroboot/current
+#      nodeAffinity:
+#        required:
+#          nodeSelectorTerms:
+#          - matchExpressions:
+#            - key: sandbox.kvm
+#              operator: In
+#              values: ["true"]
+#    EOF
+#
+# 3. The PVC above will bind to this PV
+
+---
+# Alternative: Use an init container to download the release
+# 
+# If you don't want to pre-provision storage, use an init container
+# that downloads the release tarball and extracts it to an emptyDir.
+# See deployment.yaml for the init container configuration.

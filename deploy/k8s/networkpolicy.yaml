@@ -1,0 +1,104 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: xboot-internal-only
+  namespace: xboot
+  labels:
+    app.kubernetes.io/name: xboot
+    app.kubernetes.io/component: network-policy
+    app.kubernetes.io/part-of: xboot
+spec:
+  # Apply to all pods with the xboot label
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: xboot
+  
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  ingress:
+  # Allow HTTP traffic from specific namespaces only
+  # Adjust these rules based on your cluster topology
+  
+  # Allow from ingress controller namespace
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx  # Adjust to your ingress namespace
+    ports:
+    - protocol: TCP
+      port: 8080
+  
+  # Allow from monitoring namespace
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 8080
+    # Allow metrics endpoint specifically
+    - protocol: TCP
+      port: 8080  # /v1/metrics
+  
+  # Allow from same namespace (for pod-to-pod communication)
+  - from:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8080
+  
+  egress:
+  # Deny all egress by default (egress isolation)
+  # XBOOT doesn't need outbound connectivity for its core function
+  
+  # If you need to allow specific egress, add rules here:
+  # - to:
+  #   - namespaceSelector:
+  #       matchLabels:
+  #         name: kube-system
+  #   ports:
+  #   - protocol: UDP
+  #     port: 53  # DNS
+
+---
+# Alternative: Allow specific egress for logging/metrics
+#
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: xboot-egress-allowed
+#   namespace: xboot
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app.kubernetes.io/name: xboot
+#   policyTypes:
+#   - Egress
+#   egress:
+#   # Allow DNS
+#   - to:
+#     - namespaceSelector: {}
+#       podSelector:
+#         matchLabels:
+#           k8s-app: kube-dns
+#     ports:
+#     - protocol: UDP
+#       port: 53
+#   # Allow metrics export
+#   - to:
+#     - namespaceSelector:
+#         matchLabels:
+#           name: monitoring
+#     ports:
+#     - protocol: TCP
+#       port: 9090  # Prometheus
+#   # Allow log shipping
+#   - to:
+#     - namespaceSelector:
+#         matchLabels:
+#           name: logging
+#     ports:
+#     - protocol: TCP
+#       port: 443  # HTTPS for log aggregator
