@@ -182,7 +182,7 @@ fn verify_kvm() -> Result<()> {
         return Ok(());
     }
 
-    #[allow(unreachable_code)]
+    #[cfg(not(target_os = "linux"))]
     bail!("KVM verification is only supported on Linux")
 }
 
