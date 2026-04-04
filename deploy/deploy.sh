@@ -95,7 +95,7 @@ build_template_spec() {
   local part
   for part in "${parts[@]}"; do
     if [[ -n "$joined" ]]; then
-      joined+=","
+      joined+="," 
     fi
     joined+="$part"
   done
@@ -191,12 +191,47 @@ run_remote_ready_check() {
   ssh "$server" "curl -fsS http://127.0.0.1:$PORT/v1/ready >/dev/null"
 }
 
-run_remote_exec_smoke() {
+run_remote_health_check() {
   local server="$1"
+  ssh "$server" "python3 - <<'PY'
+import json
+import urllib.request
+
+with urllib.request.urlopen('http://127.0.0.1:$PORT/v1/health') as response:
+    payload = json.load(response)
+if payload.get('status') != 'ok':
+    raise SystemExit(f\"/v1/health not ok: {payload.get('status')}\")
+bad = sorted(
+    name for name, status in (payload.get('templates') or {}).items()
+    if not status.get('ready')
+)
+if bad:
+    raise SystemExit('unhealthy templates: ' + ', '.join(bad))
+PY"
+}
+
+run_remote_exec_smoke_for_language() {
+  local server="$1"
+  local language="$2"
+  local code
+  if [[ "$language" == "node" ]]; then
+    code='console.log(40+2)'
+  else
+    code='print(40+2)'
+  fi
   ssh "$server" "curl -fsS -X POST http://127.0.0.1:$PORT/v1/exec \
     -H 'content-type: application/json' \
     ${SMOKE_BEARER_TOKEN:+-H 'authorization: Bearer $SMOKE_BEARER_TOKEN'} \
-    -d '{\"language\":\"python\",\"code\":\"print(40+2)\",\"timeout_seconds\":5}' >/dev/null"
+    -d '{\"language\":\"$language\",\"code\":\"$code\",\"timeout_seconds\":5}' >/dev/null"
+}
+
+run_remote_exec_smoke_all() {
+  local server="$1"
+  local entry lang workdir manifest_path
+  for entry in "${TEMPLATE_ENTRIES[@]}"; do
+    IFS='|' read -r lang workdir manifest_path <<<"$entry"
+    run_remote_exec_smoke_for_language "$server" "$lang"
+  done
 }
 
 rollback_remote_release() {
@@ -211,7 +246,8 @@ rollback_remote_release() {
   ssh "$server" "sudo systemctl restart zeroboot"
   sleep 3
   run_remote_ready_check "$server" || { echo "ROLLBACK FAILED: readiness check failed on $server" >&2; return 1; }
-  run_remote_exec_smoke "$server" || { echo "ROLLBACK FAILED: smoke test failed on $server" >&2; return 1; }
+  run_remote_health_check "$server" || { echo "ROLLBACK FAILED: health check failed on $server" >&2; return 1; }
+  run_remote_exec_smoke_all "$server" || { echo "ROLLBACK FAILED: exec smoke failed on $server" >&2; return 1; }
 }
 
 RELEASE_ARCHIVE="$(mktemp -t zeroboot-release.XXXXXX.tgz)"
@@ -279,7 +315,13 @@ PY"
     continue
   fi
 
-  if ! run_remote_exec_smoke "$server"; then
+  if ! run_remote_health_check "$server"; then
+    echo "Health check failed on $server"
+    rollback_remote_release "$server" "$RELEASE_ID" "$CURRENT_RELEASE"
+    continue
+  fi
+
+  if ! run_remote_exec_smoke_all "$server"; then
     echo "Exec smoke failed on $server"
     rollback_remote_release "$server" "$RELEASE_ID" "$CURRENT_RELEASE"
     continue

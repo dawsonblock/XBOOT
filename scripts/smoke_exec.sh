@@ -44,10 +44,11 @@ fi
 # Test /health endpoint
 echo -n "Testing /health... "
 health_status=$(curl -fsS "$BASE_URL/health" 2>/dev/null | jq -r '.status // "unknown"')
-if [[ "$health_status" == "healthy" ]]; then
+if [[ "$health_status" == "ok" ]]; then
     echo "OK (status: $health_status)"
 else
-    echo "WARN (status: $health_status)"
+    echo "FAIL (status: $health_status)"
+    exit 1
 fi
 
 # Test Python exec
