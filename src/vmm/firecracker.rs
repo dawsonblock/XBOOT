@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 const FC_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_READY_PREFIX: &str = "ZEROBOOT_READY";
+const MAX_READY_LINE_BYTES: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct GuestReady {
@@ -48,16 +49,45 @@ fn parse_guest_ready_line(line: &str) -> Result<GuestReady> {
     })
 }
 
+fn fcntl_getfl(fd: i32) -> Result<i32> {
+    loop {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            return Ok(flags);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err.into());
+    }
+}
+
+fn fcntl_setfl(fd: i32, flags: i32) -> Result<()> {
+    loop {
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+        if rc >= 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err.into());
+    }
+}
+
 fn set_nonblocking<T: AsRawFd>(stream: &T, label: &str) -> Result<()> {
     let fd = stream.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        bail!("failed to get {} flags: {}", label, std::io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        bail!("failed to set {} nonblocking: {}", label, std::io::Error::last_os_error());
-    }
+    let flags = fcntl_getfl(fd).with_context(|| format!("failed to get {} flags", label))?;
+    fcntl_setfl(fd, flags | libc::O_NONBLOCK)
+        .with_context(|| format!("failed to set {} nonblocking", label))?;
     Ok(())
+}
+
+fn terminate_child(process: &mut Child) {
+    let _ = process.kill();
+    let _ = process.wait();
 }
 
 pub struct FirecrackerVm {
@@ -128,15 +158,22 @@ impl FirecrackerVm {
             })?;
 
         if let Some(stdout) = process.stdout.as_ref() {
-            set_nonblocking(stdout, "firecracker stdout")?;
+            if let Err(err) = set_nonblocking(stdout, "firecracker stdout") {
+                terminate_child(&mut process);
+                return Err(err);
+            }
         }
         if let Some(stderr) = process.stderr.as_ref() {
-            set_nonblocking(stderr, "firecracker stderr")?;
+            if let Err(err) = set_nonblocking(stderr, "firecracker stderr") {
+                terminate_child(&mut process);
+                return Err(err);
+            }
         }
 
         let start = Instant::now();
         while !Path::new(&socket_path).exists() {
             if start.elapsed() > Duration::from_secs(5) {
+                terminate_child(&mut process);
                 bail!("Firecracker socket did not appear");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -222,7 +259,6 @@ impl FirecrackerVm {
                 .as_mut()
                 .context("stdout reader not initialized")?;
 
-            line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => {
                     if let Ok(Some(status)) = self.process.try_wait() {
@@ -231,9 +267,20 @@ impl FirecrackerVm {
                             status
                         );
                     }
+                    if line.len() > MAX_READY_LINE_BYTES {
+                        bail!("guest readiness line exceeded {} bytes", MAX_READY_LINE_BYTES);
+                    }
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Ok(_) => {
+                    if line.len() > MAX_READY_LINE_BYTES {
+                        bail!("guest readiness line exceeded {} bytes", MAX_READY_LINE_BYTES);
+                    }
+                    if !line.ends_with('\n') {
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
                         eprintln!("guest: {}", trimmed);
@@ -254,15 +301,16 @@ impl FirecrackerVm {
                         );
                         return Ok(ready);
                     }
+                    line.clear();
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                Err(e) => {
+                Err(e) if e.kind() == ErrorKind::Interrupted => {
                     std::thread::sleep(Duration::from_millis(20));
-                    if start.elapsed() > timeout {
-                        bail!("guest readiness read failed: {}", e);
-                    }
+                }
+                Err(e) => {
+                    bail!("guest readiness read failed: {}", e);
                 }
             }
         }
@@ -365,6 +413,7 @@ impl FirecrackerVm {
                     Ok(0) => break,
                     Ok(n) => collected.extend_from_slice(&buf[..n]),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
