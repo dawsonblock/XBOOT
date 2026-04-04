@@ -71,6 +71,8 @@ for item in templates:
     manifest_path = item.get("manifest_path")
     if not language or not workdir or not manifest_path:
         raise SystemExit("template entry requires language, workdir, and manifest_path")
+    if language not in {"python", "node"}:
+        raise SystemExit(f"unsupported template language in release receipt: {language}")
     if not (release_dir / workdir).is_dir():
         raise SystemExit(f"missing template workdir in release: {workdir}")
     if not (release_dir / manifest_path).is_file():
@@ -191,12 +193,71 @@ run_remote_ready_check() {
   ssh "$server" "curl -fsS http://127.0.0.1:$PORT/v1/ready >/dev/null"
 }
 
-run_remote_exec_smoke() {
+run_remote_health_check() {
   local server="$1"
+  ssh "$server" "python3 - '$PORT' <<'PY'
+import json
+import sys
+import urllib.request
+
+port = sys.argv[1]
+with urllib.request.urlopen(f'http://127.0.0.1:{port}/v1/health', timeout=10) as response:
+    payload = json.load(response)
+if payload.get('status') != 'ok':
+    raise SystemExit(f\"/v1/health not ok: {payload.get('status')}\")
+bad = sorted(
+    name for name, status in (payload.get('templates') or {}).items()
+    if not status.get('ready')
+)
+if bad:
+    raise SystemExit('unhealthy templates: ' + ', '.join(bad))
+PY"
+}
+
+run_remote_release_languages() {
+  local server="$1"
+  local release_root="$2"
+  ssh "$server" "python3 - '$release_root/release-receipt.json' <<'PY'
+import json
+import pathlib
+import sys
+
+receipt = json.loads(pathlib.Path(sys.argv[1]).read_text())
+templates = receipt.get('templates')
+if not isinstance(templates, list) or not templates:
+    raise SystemExit('release-receipt.json missing templates[]')
+for item in templates:
+    language = item.get('language')
+    if language not in {'python', 'node'}:
+        raise SystemExit(f'unsupported template language in release receipt: {language}')
+    print(language)
+PY"
+}
+
+run_remote_exec_smoke_for_language() {
+  local server="$1"
+  local language="$2"
+  local code
+  if [[ "$language" == "node" ]]; then
+    code='console.log(40+2)'
+  else
+    code='print(40+2)'
+  fi
   ssh "$server" "curl -fsS -X POST http://127.0.0.1:$PORT/v1/exec \
     -H 'content-type: application/json' \
     ${SMOKE_BEARER_TOKEN:+-H 'authorization: Bearer $SMOKE_BEARER_TOKEN'} \
-    -d '{\"language\":\"python\",\"code\":\"print(40+2)\",\"timeout_seconds\":5}' >/dev/null"
+    -d '{\"language\":\"$language\",\"code\":\"$code\",\"timeout_seconds\":5}' >/dev/null"
+}
+
+run_remote_exec_smoke_all() {
+  local server="$1"
+  local release_root="$2"
+  local lang
+  mapfile -t remote_languages < <(run_remote_release_languages "$server" "$release_root")
+  [[ ${#remote_languages[@]} -gt 0 ]] || { echo "release receipt contains no templates on $server: $release_root" >&2; return 1; }
+  for lang in "${remote_languages[@]}"; do
+    run_remote_exec_smoke_for_language "$server" "$lang" || return 1
+  done
 }
 
 rollback_remote_release() {
@@ -205,13 +266,15 @@ rollback_remote_release() {
   local previous_release="$3"
   [[ -n "$previous_release" ]] || { echo "no previous release recorded for rollback on $server" >&2; return 1; }
 
+  local previous_release_root="$REMOTE_ROOT/releases/$previous_release"
   echo "Rolling back $server to $previous_release"
   ssh "$server" "cd '$REMOTE_ROOT' && sudo ln -sfn 'releases/$previous_release' current"
   update_remote_deploy_state "$server" "$previous_release" "$failed_release"
   ssh "$server" "sudo systemctl restart zeroboot"
   sleep 3
   run_remote_ready_check "$server" || { echo "ROLLBACK FAILED: readiness check failed on $server" >&2; return 1; }
-  run_remote_exec_smoke "$server" || { echo "ROLLBACK FAILED: smoke test failed on $server" >&2; return 1; }
+  run_remote_health_check "$server" || { echo "ROLLBACK FAILED: health check failed on $server" >&2; return 1; }
+  run_remote_exec_smoke_all "$server" "$previous_release_root" || { echo "ROLLBACK FAILED: exec smoke failed on $server" >&2; return 1; }
 }
 
 RELEASE_ARCHIVE="$(mktemp -t zeroboot-release.XXXXXX.tgz)"
@@ -279,7 +342,13 @@ PY"
     continue
   fi
 
-  if ! run_remote_exec_smoke "$server"; then
+  if ! run_remote_health_check "$server"; then
+    echo "Health check failed on $server"
+    rollback_remote_release "$server" "$RELEASE_ID" "$CURRENT_RELEASE"
+    continue
+  fi
+
+  if ! run_remote_exec_smoke_all "$server" "$REMOTE_RELEASE_ROOT"; then
     echo "Exec smoke failed on $server"
     rollback_remote_release "$server" "$RELEASE_ID" "$CURRENT_RELEASE"
     continue
