@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -10,8 +11,8 @@ use std::time::{Duration, Instant};
 
 const FC_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_READY_PREFIX: &str = "ZEROBOOT_READY";
+const MAX_READY_LINE_BYTES: usize = 4096;
 
-/// Parsed guest readiness information from handshake
 #[derive(Debug, Clone)]
 pub struct GuestReady {
     pub protocol_version: String,
@@ -19,7 +20,6 @@ pub struct GuestReady {
     pub worker_node: bool,
 }
 
-/// Parse the guest ready line: "ZEROBOOT_READY proto=ZB1 worker_python=1 worker_node=1"
 fn parse_guest_ready_line(line: &str) -> Result<GuestReady> {
     let mut proto = None;
     let mut worker_python = false;
@@ -49,11 +49,52 @@ fn parse_guest_ready_line(line: &str) -> Result<GuestReady> {
     })
 }
 
+fn fcntl_getfl(fd: i32) -> Result<i32> {
+    loop {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            return Ok(flags);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err.into());
+    }
+}
+
+fn fcntl_setfl(fd: i32, flags: i32) -> Result<()> {
+    loop {
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+        if rc >= 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err.into());
+    }
+}
+
+fn set_nonblocking<T: AsRawFd>(stream: &T, label: &str) -> Result<()> {
+    let fd = stream.as_raw_fd();
+    let flags = fcntl_getfl(fd).with_context(|| format!("failed to get {} flags", label))?;
+    fcntl_setfl(fd, flags | libc::O_NONBLOCK)
+        .with_context(|| format!("failed to set {} nonblocking", label))?;
+    Ok(())
+}
+
+fn terminate_child(process: &mut Child) {
+    let _ = process.kill();
+    let _ = process.wait();
+}
+
 pub struct FirecrackerVm {
     process: Child,
     socket_path: String,
     snapshot_dir: String,
-    stdout_reader: Option<BufReader<Box<dyn Read + Send>>>, // Persistent reader for guest output
+    stdout_reader: Option<BufReader<Box<dyn Read + Send>>>,
 }
 
 #[derive(Serialize)]
@@ -103,7 +144,7 @@ impl FirecrackerVm {
         let firecracker_bin = startup::resolved_firecracker_binary()?;
 
         eprintln!("Starting Firecracker...");
-        let process = Command::new(&firecracker_bin)
+        let mut process = Command::new(&firecracker_bin)
             .args(["--api-sock", &socket_path])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -116,9 +157,23 @@ impl FirecrackerVm {
                 )
             })?;
 
+        if let Some(stdout) = process.stdout.as_ref() {
+            if let Err(err) = set_nonblocking(stdout, "firecracker stdout") {
+                terminate_child(&mut process);
+                return Err(err);
+            }
+        }
+        if let Some(stderr) = process.stderr.as_ref() {
+            if let Err(err) = set_nonblocking(stderr, "firecracker stderr") {
+                terminate_child(&mut process);
+                return Err(err);
+            }
+        }
+
         let start = Instant::now();
         while !Path::new(&socket_path).exists() {
             if start.elapsed() > Duration::from_secs(5) {
+                terminate_child(&mut process);
                 bail!("Firecracker socket did not appear");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -129,7 +184,7 @@ impl FirecrackerVm {
             process,
             socket_path,
             snapshot_dir,
-            stdout_reader: None, // Will be created on first use
+            stdout_reader: None,
         };
         vm.api_put(
             "/machine-config",
@@ -167,13 +222,10 @@ impl FirecrackerVm {
         Ok(vm)
     }
 
-    /// Wait for guest to signal readiness with explicit protocol handshake.
-    /// Returns parsed GuestReady information with protocol version and available workers.
     pub fn wait_for_guest_ready(&mut self, timeout: Duration) -> Result<GuestReady> {
         let start = Instant::now();
         let mut line = String::with_capacity(256);
 
-        // Initialize persistent reader on first call
         if self.stdout_reader.is_none() {
             let stdout = self
                 .process
@@ -184,48 +236,57 @@ impl FirecrackerVm {
         }
 
         loop {
-            // Check if process exited FIRST (before any borrow)
             if let Ok(Some(status)) = self.process.try_wait() {
                 bail!("Firecracker exited before guest became ready: {}", status);
             }
 
             if start.elapsed() > timeout {
                 let stderr_tail = self.read_stderr_tail();
+                let stderr_detail = if stderr_tail.is_empty() {
+                    "no stderr output captured".to_string()
+                } else {
+                    stderr_tail
+                };
                 bail!(
                     "guest readiness handshake timed out after {:?}: {}",
                     timeout,
-                    stderr_tail
+                    stderr_detail
                 );
             }
 
-            // Use persistent reader instead of creating new one each iteration
             let reader = self
                 .stdout_reader
                 .as_mut()
                 .context("stdout reader not initialized")?;
 
-            line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => {
-                    // EOF - guest may have closed stdout, check if process exited
                     if let Ok(Some(status)) = self.process.try_wait() {
                         bail!(
                             "Firecracker process exited during guest ready wait: {}",
                             status
                         );
                     }
+                    if line.len() > MAX_READY_LINE_BYTES {
+                        bail!("guest readiness line exceeded {} bytes", MAX_READY_LINE_BYTES);
+                    }
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Ok(_) => {
+                    if line.len() > MAX_READY_LINE_BYTES {
+                        bail!("guest readiness line exceeded {} bytes", MAX_READY_LINE_BYTES);
+                    }
+                    if !line.ends_with('\n') {
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
                         eprintln!("guest: {}", trimmed);
                     }
                     if trimmed.starts_with(GUEST_READY_PREFIX) {
-                        // Parse the ready line to extract protocol and worker info
                         let ready = parse_guest_ready_line(trimmed)?;
-
-                        // Validate protocol version matches our expected version
                         if ready.protocol_version != protocol::PROTOCOL_VERSION {
                             bail!(
                                 "protocol version mismatch: guest sent '{}', we expect '{}'",
@@ -240,13 +301,16 @@ impl FirecrackerVm {
                         );
                         return Ok(ready);
                     }
+                    line.clear();
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {
+                    std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(e) => {
-                    // WouldBlock or other error - this is expected when no data available
-                    std::thread::sleep(Duration::from_millis(20));
-                    if start.elapsed() > timeout {
-                        bail!("guest readiness read failed: {}", e);
-                    }
+                    bail!("guest readiness read failed: {}", e);
                 }
             }
         }
@@ -285,20 +349,17 @@ impl FirecrackerVm {
     fn api_put<T: Serialize>(&self, path: &str, body: &T) -> Result<String> {
         self.api_request("PUT", path, body)
     }
+
     fn api_patch<T: Serialize>(&self, path: &str, body: &T) -> Result<String> {
         self.api_request("PATCH", path, body)
     }
 
-    /// Parse HTTP response and extract status code properly.
-    /// Returns Ok(status_code) on success, or error with details on failure.
     fn parse_http_response(resp: &str) -> Result<u16> {
-        // Find the status line (first line)
         let status_line = resp
             .lines()
             .next()
             .ok_or_else(|| anyhow::anyhow!("empty HTTP response"))?;
 
-        // Parse "HTTP/1.1 XXX ..."
         let parts: Vec<&str> = status_line.split_whitespace().collect();
         if parts.len() < 2 {
             bail!("malformed HTTP status line: {}", status_line);
@@ -327,10 +388,8 @@ impl FirecrackerVm {
         let n = stream.read(&mut response)?;
         let resp = String::from_utf8_lossy(&response[..n]).to_string();
 
-        // Parse HTTP response properly instead of naive string contains
         let status_code = Self::parse_http_response(&resp)?;
 
-        // Consider 2xx status codes as success
         if !(200..=299).contains(&status_code) {
             bail!(
                 "Firecracker API error on {} {}: HTTP {} - {}",
@@ -343,19 +402,23 @@ impl FirecrackerVm {
         Ok(resp)
     }
 
-    /// Read stderr tail with bounded reads to avoid blocking.
-    /// Returns at most 4KB of stderr content.
     fn read_stderr_tail(&mut self) -> String {
-        let mut buf = vec![0u8; 4096]; // 4KB max
+        let mut collected = Vec::with_capacity(4096);
         if let Some(stderr) = self.process.stderr.as_mut() {
-            // Use non-blocking read with timeout
-            match stderr.read(&mut buf) {
-                Ok(n) => String::from_utf8_lossy(&buf[..n]).trim().to_string(),
-                Err(_) => String::new(),
+            let mut buf = [0u8; 1024];
+            while collected.len() < 4096 {
+                let remaining = 4096 - collected.len();
+                let slice_len = remaining.min(buf.len());
+                match stderr.read(&mut buf[..slice_len]) {
+                    Ok(0) => break,
+                    Ok(n) => collected.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
             }
-        } else {
-            String::new()
         }
+        String::from_utf8_lossy(&collected).trim().to_string()
     }
 
     pub fn kill(&mut self) {
@@ -387,27 +450,18 @@ pub fn create_template_snapshot(
     let mem_bytes = std::fs::metadata(&mem_path)?.len();
     let fc_version = firecracker_version();
     let manifest = template_manifest::TemplateManifest {
-        // Core identity fields
         schema_version: Some(1),
         template_id: Some(uuid::Uuid::new_v4().to_string()),
         build_id: Some(uuid::Uuid::new_v4().to_string()),
         artifact_set_id: Some(uuid::Uuid::new_v4().to_string()),
-
-        // Trust and promotion (default to dev for newly created templates)
         promotion_channel: Some("dev".to_string()),
-
-        // Trust - newly created templates are not yet signed
         signer_key_id: None,
         manifest_signature: None,
         manifest_signed_fields: None,
-
-        // Build provenance
         built_from_git_rev: std::env::var("ZEROBOOT_GIT_REV").ok(),
         build_host: std::env::var("ZEROBOOT_BUILD_HOST").ok(),
         firecracker_binary_sha256: firecracker_binary_sha256()
             .or_else(|| std::env::var("ZEROBOOT_FC_BINARY_SHA256").ok()),
-
-        // Original fields
         language: Some(infer_language_from_rootfs(rootfs_path)),
         kernel_path: kernel_path.to_string(),
         kernel_sha256: Some(template_manifest::sha256_hex(Path::new(kernel_path))?),
@@ -422,7 +476,7 @@ pub fn create_template_snapshot(
         snapshot_state_sha256: Some(template_manifest::sha256_hex(Path::new(&state_path))?),
         snapshot_mem_sha256: Some(template_manifest::sha256_hex(Path::new(&mem_path))?),
         firecracker_version: fc_version,
-        protocol_version: Some(ready.protocol_version), // Use guest's reported protocol version
+        protocol_version: Some(ready.protocol_version),
         vcpu_count: Some(1),
         created_at_unix_ms: Some(current_unix_ms()),
     };

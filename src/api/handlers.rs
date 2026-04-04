@@ -555,10 +555,12 @@ fn truncate_bytes(mut data: Vec<u8>, max_len: usize) -> (Vec<u8>, bool) {
     (data, true)
 }
 
-fn normalize_language(language: &str) -> String {
-    match language {
-        "node" | "javascript" => "node".into(),
-        _ => "python".into(),
+fn normalize_language(language: &str) -> Option<String> {
+    let normalized = language.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "python" | "py" => Some("python".into()),
+        "node" | "javascript" | "js" => Some("node".into()),
+        _ => None,
     }
 }
 
@@ -574,7 +576,17 @@ fn execute_code_internal(
         .concurrent_forks
         .fetch_add(1, Ordering::Relaxed);
     let res = (|| -> ExecResponse {
-        let lang = normalize_language(&req.language);
+        let Some(lang) = normalize_language(&req.language) else {
+            state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
+            return error_response(
+                request_id,
+                format!("Unsupported language: {}", req.language),
+                "validation",
+                total_start,
+                0.0,
+                0.0,
+            );
+        };
         let limits = &state.config.limits;
         if req.code.len() > limits.max_code_bytes {
             state.metrics.total_errors.fetch_add(1, Ordering::Relaxed);
