@@ -62,7 +62,7 @@ function parseChildResponse(data) {
   const stdoutLen = parseInt(header[4], 10);
   const stderrLen = parseInt(header[5], 10);
   const flags = parseInt(header[6], 10);
-  if (isNaN(requestIdLen) || isNaN(exitCode) || isNaN(stdoutLen) || isNaN(stderrLen) || isNaN(flags)) {
+  if ([requestIdLen, exitCode, stdoutLen, stderrLen, flags].some(isNaN)) {
     throw new Error('malformed child response: non-integer length field');
   }
   if (requestIdLen < 0 || stdoutLen < 0 || stderrLen < 0) {

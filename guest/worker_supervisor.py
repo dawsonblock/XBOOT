@@ -126,7 +126,10 @@ def _make_child_preexec_fn(timeout_ms: int):
         def _clamp(kind, desired):
             soft, hard = _resource.getrlimit(kind)
             target = desired if hard == _resource.RLIM_INFINITY else min(desired, hard)
-            target_soft = target if soft == _resource.RLIM_INFINITY else (min(target, soft) if soft < target else target)
+            if soft == _resource.RLIM_INFINITY or soft >= target:
+                target_soft = target
+            else:
+                target_soft = min(target, soft)
             try:
                 _resource.setrlimit(kind, (target_soft, target))
             except (ValueError, OSError):
