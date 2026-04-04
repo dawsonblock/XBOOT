@@ -230,7 +230,7 @@ run_remote_exec_smoke_all() {
   local entry lang workdir manifest_path
   for entry in "${TEMPLATE_ENTRIES[@]}"; do
     IFS='|' read -r lang workdir manifest_path <<<"$entry"
-    run_remote_exec_smoke_for_language "$server" "$lang"
+    run_remote_exec_smoke_for_language "$server" "$lang" || return 1
   done
 }
 
