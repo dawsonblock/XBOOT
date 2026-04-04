@@ -2,6 +2,25 @@
 set -euo pipefail
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1" >&2; exit 1; }; }
+
+resolve_firecracker_bin() {
+  local candidate="${ZEROBOOT_FIRECRACKER_BIN:-firecracker}"
+  if [[ "$candidate" == */* ]]; then
+    [[ -x "$candidate" ]] || {
+      echo "firecracker binary is not executable: $candidate" >&2
+      exit 1
+    }
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  command -v "$candidate" >/dev/null 2>&1 || {
+    echo "missing firecracker binary: $candidate" >&2
+    exit 1
+  }
+  command -v "$candidate"
+}
+
 need curl
 need sha256sum
 need python3
@@ -26,9 +45,10 @@ if [[ -n "${ZEROBOOT_MIN_FREE_BYTES:-}" || -n "${ZEROBOOT_MIN_FREE_INODES:-}" ]]
   fi
 fi
 
+fc_bin=""
 if [[ -n "${ZEROBOOT_ALLOWED_FIRECRACKER_VERSION:-}" ]]; then
-  need firecracker
-  actual_fc="$(firecracker --version 2>/dev/null || true)"
+  fc_bin="$(resolve_firecracker_bin)"
+  actual_fc="$($fc_bin --version 2>&1 || true)"
   [[ "$actual_fc" == "$ZEROBOOT_ALLOWED_FIRECRACKER_VERSION" ]] || {
     echo "firecracker version mismatch: expected '$ZEROBOOT_ALLOWED_FIRECRACKER_VERSION', got '$actual_fc'" >&2
     exit 1
@@ -36,8 +56,10 @@ if [[ -n "${ZEROBOOT_ALLOWED_FIRECRACKER_VERSION:-}" ]]; then
 fi
 
 if [[ -n "${ZEROBOOT_ALLOWED_FC_BINARY_SHA256:-}" ]]; then
-  need firecracker
-  actual_sha="$(sha256sum "$(command -v firecracker)" | awk '{print $1}')"
+  if [[ -z "$fc_bin" ]]; then
+    fc_bin="$(resolve_firecracker_bin)"
+  fi
+  actual_sha="$(sha256sum "$fc_bin" | awk '{print $1}')"
   [[ "$actual_sha" == "${ZEROBOOT_ALLOWED_FC_BINARY_SHA256,,}" ]] || {
     echo "firecracker sha mismatch: expected '$ZEROBOOT_ALLOWED_FC_BINARY_SHA256', got '$actual_sha'" >&2
     exit 1

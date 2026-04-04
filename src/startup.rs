@@ -329,7 +329,7 @@ fn statvfs(path: &Path) -> Result<FsStats> {
         );
     }
     Ok(FsStats {
-        free_bytes: (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64),
-        free_inodes: stat.f_favail as u64,
+        free_bytes: stat.f_bavail.saturating_mul(stat.f_frsize),
+        free_inodes: stat.f_favail,
     })
 }

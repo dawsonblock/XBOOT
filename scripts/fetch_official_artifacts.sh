@@ -63,6 +63,7 @@ fc_actual="$(sha256_file "$fc_bin")"
   echo "firecracker binary sha256 mismatch: expected $FC_BIN_SHA256 got $fc_actual" >&2
   exit 1
 }
+ln -sfn "$(basename "$fc_bin")" "$OUT_DIR/firecracker/release-v1.12.0-x86_64/firecracker"
 
 fetch "$KERNEL_URL" "$OUT_DIR/kernel/vmlinux-5.10.223" "$KERNEL_SHA256"
 fetch "$ROOTFS_URL" "$OUT_DIR/rootfs/ubuntu-22.04.ext4" "$ROOTFS_SHA256"
@@ -71,6 +72,7 @@ fetch "$NODE_URL" "$OUT_DIR/node/node-v20.20.2-linux-x64.tar.xz" "$NODE_SHA256"
 cat <<EOF
 Fetched and verified:
   firecracker: $fc_bin
+  firecracker shim: $OUT_DIR/firecracker/release-v1.12.0-x86_64/firecracker
   kernel: $OUT_DIR/kernel/vmlinux-5.10.223
   rootfs: $OUT_DIR/rootfs/ubuntu-22.04.ext4
   node runtime tarball: $OUT_DIR/node/node-v20.20.2-linux-x64.tar.xz
