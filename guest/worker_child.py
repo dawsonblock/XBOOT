@@ -11,11 +11,6 @@ import sys
 import tempfile
 import traceback
 
-try:
-    import resource
-except ImportError:  # pragma: no cover
-    resource = None
-
 FLAG_STDOUT_TRUNCATED = 1
 FLAG_STDERR_TRUNCATED = 2
 TRUNCATION_MARKER = b"\n[truncated]\n"
@@ -44,43 +39,6 @@ def write_response(request_id: bytes, exit_code: int, error_type: str, stdout: b
 
 def timeout_handler(_signum, _frame):
     raise TimeoutError("execution timed out")
-
-
-def apply_limits(timeout_ms: int, limits: dict) -> list[str]:
-    if resource is None:
-        return []
-
-    failures: list[str] = []
-    profile = limit_profile()
-
-    def clamp_and_set(kind, desired):
-        soft, hard = resource.getrlimit(kind)
-        if hard == resource.RLIM_INFINITY:
-            target = desired
-        else:
-            target = min(desired, hard)
-        if soft == resource.RLIM_INFINITY:
-            target_soft = target
-        else:
-            target_soft = min(target, soft) if soft < target else target
-        try:
-            resource.setrlimit(kind, (target_soft, target))
-        except (ValueError, OSError) as exc:
-            failures.append(f"{kind}:{exc}")
-
-    cpu_seconds = max(1, int((timeout_ms + 1999) / 1000))
-    memory_bytes = int(limits.get("memory_bytes", 512 * 1024 * 1024))
-    nofile = int(limits.get("nofile", 64))
-    nproc = int(limits.get("nproc", 16))
-    fsize_bytes = int(limits.get("fsize_bytes", 2 * 1024 * 1024))
-    clamp_and_set(resource.RLIMIT_CPU, cpu_seconds)
-    if profile != "compat" and hasattr(resource, "RLIMIT_AS"):
-        clamp_and_set(resource.RLIMIT_AS, memory_bytes)
-    clamp_and_set(resource.RLIMIT_NOFILE, nofile)
-    if profile != "compat" and hasattr(resource, "RLIMIT_NPROC"):
-        clamp_and_set(resource.RLIMIT_NPROC, nproc)
-    clamp_and_set(resource.RLIMIT_FSIZE, fsize_bytes)
-    return failures
 
 
 def directory_size(path: str) -> int:
@@ -119,7 +77,6 @@ def main():
 
         signal.signal(signal.SIGALRM, timeout_handler)
         signal.setitimer(signal.ITIMER_REAL, timeout_ms / 1000.0)
-        limit_failures = apply_limits(timeout_ms, limits)
 
         scratch = tempfile.mkdtemp(prefix="zeroboot-")
         os.environ.clear()
@@ -140,8 +97,6 @@ def main():
         error_type = "ok"
         with contextlib.redirect_stdout(stdout_io), contextlib.redirect_stderr(stderr_io):
             exec(compile(code, "<zeroboot>", "exec"), globals_dict, globals_dict)
-        if limit_failures:
-            stderr_io.write("limit setup degraded: " + ", ".join(limit_failures) + "\n")
         if directory_size(scratch) > max_tmp_bytes:
             exit_code = 1
             error_type = "runtime"

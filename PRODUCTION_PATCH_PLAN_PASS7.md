@@ -34,16 +34,8 @@ This pass does two things:
 
 ### P0 — trust and release hygiene
 
-#### `src/main.rs`
-- load only signed, promoted templates
-- separate cold template loading from hot request serving
-
-#### `src/template_manifest.rs`
-- add signature field verification
-- reject unsigned templates in prod mode
-
-#### `scripts/validate_template_manifest.py`
-- verify detached signature metadata when present
+Template signing, hashed API key verification, and startup validation are implemented.
+The remaining work in this area:
 
 #### `.github/workflows/ci.yml`
 - add a self-hosted Linux KVM lane
@@ -76,8 +68,8 @@ This pass does two things:
 
 ### P3 — auth and secrets
 
-#### `src/main.rs` and `src/api/handlers.rs`
-- replace plain API key storage with hashed key IDs + rotation metadata
+API key hashing (HMAC-SHA256 + server pepper) and constant-time comparison are implemented
+in `src/auth.rs`. The remaining work:
 
 #### `scripts/make_api_keys.py`
 - emit one-time-display secrets and hashed server records
@@ -88,6 +80,4 @@ A pass can reasonably be called production-grade only after all of these are tru
 
 - live KVM CI exists
 - warm pools exist
-- signed artifact promotion exists
-- prod auth no longer stores plain keys
 - dashboard, docs, and emitted metrics stay in sync

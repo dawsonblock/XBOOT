@@ -35,10 +35,11 @@ class GuestWorkerSubprocessTests(unittest.TestCase):
         stdin: str = "",
         limits: Optional[dict] = None,
         raw_input: Optional[bytes] = None,
+        timeout_ms: int = 2000,
     ):
         payload = {
             "request_id": "t1",
-            "timeout_ms": 2000,
+            "timeout_ms": timeout_ms,
             "code": code,
             "stdin": stdin,
             "limits": limits
@@ -131,6 +132,16 @@ class GuestWorkerSubprocessTests(unittest.TestCase):
         self.assertEqual(error_type, "ok")
         self.assertTrue(flags & 1)
         self.assertIn(b"[truncated]", stdout)
+
+    def test_child_timeout_returns_framed_result(self):
+        request_id, exit_code, error_type, _stdout, stderr, _flags = self.run_child(
+            "while True: pass",
+            timeout_ms=200,
+        )
+        self.assertEqual(request_id, b"t1")
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(error_type, "timeout")
+        self.assertIn(b"timed out", stderr)
 
 
 if __name__ == "__main__":

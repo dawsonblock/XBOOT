@@ -32,5 +32,3 @@ This archive applies a focused operational cleanup on top of `upgraded-pass6`.
 
 - no warm VM pool yet
 - no self-hosted KVM CI lane yet
-- API keys are still stored as plain strings
-- artifact signing and promotion workflow are still missing

@@ -4,6 +4,11 @@ import os
 import subprocess
 import sys
 
+try:
+    import resource as _resource
+except ImportError:  # pragma: no cover
+    _resource = None
+
 MAX_STDOUT = 64 * 1024
 MAX_STDERR = 64 * 1024
 FLAG_STDOUT_TRUNCATED = 1
@@ -79,28 +84,63 @@ def parse_child_response(data: bytes):
     header = data[:newline].decode("utf-8", "replace").strip().split()
     if len(header) != 7 or header[0] != "WRK1R":
         raise ValueError("malformed child response")
-    request_id_len = int(header[1])
-    stdout_len = int(header[4])
-    stderr_len = int(header[5])
-    payload = data[newline + 1 + request_id_len :]
-    stdout = payload[:stdout_len]
-    stderr = payload[stdout_len : stdout_len + stderr_len]
-    return int(header[2]), header[3], stdout, stderr, int(header[6])
+    try:
+        request_id_len = int(header[1])
+        exit_code = int(header[2])
+        stdout_len = int(header[4])
+        stderr_len = int(header[5])
+        flags = int(header[6])
+    except ValueError:
+        raise ValueError("malformed child response: non-integer length field")
+    if request_id_len < 0 or stdout_len < 0 or stderr_len < 0:
+        raise ValueError("malformed child response: negative length field")
+    full_payload = data[newline + 1:]
+    expected_len = request_id_len + stdout_len + stderr_len
+    if len(full_payload) != expected_len:
+        raise ValueError(
+            f"malformed child response: payload length mismatch "
+            f"(got {len(full_payload)}, expected {expected_len})"
+        )
+    stdout = full_payload[request_id_len : request_id_len + stdout_len]
+    stderr = full_payload[request_id_len + stdout_len : request_id_len + stdout_len + stderr_len]
+    return exit_code, header[3], stdout, stderr, flags
 
 
-def child_command(timeout_ms: int) -> list[str]:
-    child_script = os.environ.get("ZEROBOOT_CHILD_SCRIPT", "/zeroboot/worker_child.py")
-    python_bin = os.environ.get("ZEROBOOT_PYTHON_BIN", "python3")
+def _make_child_preexec_fn(timeout_ms: int):
+    """Return a preexec_fn that applies process-level OS resource limits.
+
+    Called after fork() but before exec() in the child process so that
+    resource limits are owned exclusively by the supervisor, not the child.
+    """
+    if _resource is None:  # pragma: no cover
+        return None
+
+    profile = limit_profile()
     cpu_seconds = max(1, int((timeout_ms + 1999) / 1000))
-    memory_kib = max(1, CHILD_MEMORY_BYTES // 1024)
-    file_kib = max(1, CHILD_FSIZE_BYTES // 1024)
-    shell_parts = [f"ulimit -t {cpu_seconds}", f"ulimit -n {CHILD_NOFILE}", f"ulimit -f {file_kib}"]
-    if limit_profile() != "compat":
-        shell_parts.insert(1, f"ulimit -v {memory_kib}")
-        shell_parts.insert(3, f"ulimit -u {CHILD_NPROC}")
-    shell_parts.append(f"exec {python_bin} {child_script}")
-    shell = "; ".join(shell_parts)
-    return ["/bin/sh", "-c", shell]
+    memory_bytes = CHILD_MEMORY_BYTES
+    nofile = CHILD_NOFILE
+    nproc = CHILD_NPROC
+    fsize_bytes = CHILD_FSIZE_BYTES
+
+    def _preexec():
+        def _clamp(kind, desired):
+            soft, hard = _resource.getrlimit(kind)
+            target = desired if hard == _resource.RLIM_INFINITY else min(desired, hard)
+            target_soft = target if soft == _resource.RLIM_INFINITY else (min(target, soft) if soft < target else target)
+            try:
+                _resource.setrlimit(kind, (target_soft, target))
+            except (ValueError, OSError):
+                pass
+
+        _clamp(_resource.RLIMIT_CPU, cpu_seconds)
+        if profile != "compat" and hasattr(_resource, "RLIMIT_AS"):
+            _clamp(_resource.RLIMIT_AS, memory_bytes)
+        _clamp(_resource.RLIMIT_NOFILE, nofile)
+        if profile != "compat" and hasattr(_resource, "RLIMIT_NPROC"):
+            _clamp(_resource.RLIMIT_NPROC, nproc)
+        _clamp(_resource.RLIMIT_FSIZE, fsize_bytes)
+
+    return _preexec
 
 
 def spawn_child_executor(request_id: str, timeout_ms: int, code: str, stdin_data: str):
@@ -122,14 +162,19 @@ def spawn_child_executor(request_id: str, timeout_ms: int, code: str, stdin_data
         }
     ).encode("utf-8")
 
+    child_script = os.environ.get("ZEROBOOT_CHILD_SCRIPT", "/zeroboot/worker_child.py")
+    python_bin = os.environ.get("ZEROBOOT_PYTHON_BIN", "python3")
+    cmd = [python_bin, child_script]
+
     try:
         result = subprocess.run(
-            child_command(timeout_ms),
+            cmd,
             input=payload,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=max(timeout_ms / 1000.0 + 2.0, 5.0),
             env=minimal_child_env(),
+            preexec_fn=_make_child_preexec_fn(timeout_ms),
         )
     except subprocess.TimeoutExpired:
         return -1, "timeout", b"", b"execution timed out\n", 0
