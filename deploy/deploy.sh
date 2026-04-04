@@ -197,7 +197,7 @@ run_remote_health_check() {
 import json
 import urllib.request
 
-with urllib.request.urlopen('http://127.0.0.1:$PORT/v1/health') as response:
+with urllib.request.urlopen('http://127.0.0.1:$PORT/v1/health', timeout=10) as response:
     payload = json.load(response)
 if payload.get('status') != 'ok':
     raise SystemExit(f\"/v1/health not ok: {payload.get('status')}\")
