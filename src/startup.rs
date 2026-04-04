@@ -172,15 +172,18 @@ fn verify_auth_and_logging_paths(config: &ServerConfig) -> Result<()> {
 }
 
 fn verify_kvm() -> Result<()> {
-    let kvm = Path::new("/dev/kvm");
-    if !kvm.exists() {
-        bail!("/dev/kvm is missing");
+    #[cfg(target_os = "linux")]
+    {
+        let kvm = Path::new("/dev/kvm");
+        if !kvm.exists() {
+            bail!("/dev/kvm is missing");
+        }
+        kvm_ioctls::Kvm::new().context("open /dev/kvm")?;
+        return Ok(());
     }
-    let metadata = std::fs::metadata(kvm).context("stat /dev/kvm")?;
-    if metadata.permissions().readonly() {
-        bail!("/dev/kvm is not writable by the current user");
-    }
-    Ok(())
+
+    #[allow(unreachable_code)]
+    bail!("KVM verification is only supported on Linux")
 }
 
 fn verify_cgroup_mode() -> Result<()> {
