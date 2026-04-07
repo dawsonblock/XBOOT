@@ -74,15 +74,19 @@ impl ApiKeyVerifier {
         // Compute expected hash: HMAC-SHA256(pepper, prefix:secret)
         let mut mac = hmac_sha256::HMAC::new(self.pepper.as_bytes());
         mac.update(format!("{}:{}", prefix, secret).as_bytes());
-        let result = mac.finalize();
-        let computed_hash = hex::encode(result);
+        let computed_bytes: [u8; 32] = mac.finalize();
 
-        // HMAC-SHA256 provides the security here; the hash comparison itself
-        // is safe because the hash output is high-entropy and unpredictable
-        if computed_hash == record.hash {
+        // Decode the stored hash from hex to bytes for constant-time comparison
+        let stored_bytes = match hex::decode(&record.hash) {
+            Ok(b) => b,
+            Err(_) => bail!("invalid key"),
+        };
+
+        // Use constant-time comparison to avoid timing side-channels
+        if ring::constant_time::verify_slices_are_equal(&computed_bytes, &stored_bytes).is_ok() {
             Ok(record.clone())
         } else {
-            bail!("invalid key");
+            bail!("invalid key")
         }
     }
 

@@ -99,5 +99,26 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertTrue(flags & 1)
         self.assertIn('[truncated]', stdout)
 
+    def test_short_payload_is_protocol_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child = Path(tmp) / 'short_payload_child.py'
+            child.write_text(
+                "import sys\n"
+                "# Header declares stdout=100 bytes but only writes 5 bytes of payload\n"
+                "req_id = b'x'\n"
+                "sys.stdout.buffer.write(b'WRK1R 1 0 ok 100 0 0\\n')\n"
+                "sys.stdout.buffer.write(req_id)\n"
+                "sys.stdout.buffer.write(b'short')\n"
+                "sys.stdout.buffer.flush()\n",
+                encoding='utf-8',
+            )
+            rid, exit_code, error_type, _stdout, stderr, _flags = self.run_worker(
+                'print(1)', child_script=child
+            )
+        self.assertEqual(rid, b't1')
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(error_type, 'protocol')
+        self.assertIn('malformed child response', stderr)
+
 if __name__ == '__main__':
     unittest.main()

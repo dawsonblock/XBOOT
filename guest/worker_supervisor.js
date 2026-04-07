@@ -58,15 +58,29 @@ function parseChildResponse(data) {
   const header = data.subarray(0, newlineIndex).toString('utf8').trim().split(/\s+/);
   if (header.length !== 7 || header[0] !== 'WRK1R') throw new Error('malformed child response');
   const requestIdLen = parseInt(header[1], 10);
+  const exitCode = parseInt(header[2], 10);
   const stdoutLen = parseInt(header[4], 10);
   const stderrLen = parseInt(header[5], 10);
-  const payload = data.subarray(newlineIndex + 1 + requestIdLen);
+  const flags = parseInt(header[6], 10);
+  if ([requestIdLen, exitCode, stdoutLen, stderrLen, flags].some(isNaN)) {
+    throw new Error('malformed child response: non-integer header field');
+  }
+  if (requestIdLen < 0 || stdoutLen < 0 || stderrLen < 0) {
+    throw new Error('malformed child response: negative length field');
+  }
+  const fullPayload = data.subarray(newlineIndex + 1);
+  const expectedLen = requestIdLen + stdoutLen + stderrLen;
+  if (fullPayload.length !== expectedLen) {
+    throw new Error(
+      `malformed child response: payload length mismatch (got ${fullPayload.length}, expected ${expectedLen})`
+    );
+  }
   return [
-    parseInt(header[2], 10),
+    exitCode,
     header[3],
-    payload.subarray(0, stdoutLen),
-    payload.subarray(stdoutLen, stdoutLen + stderrLen),
-    parseInt(header[6], 10),
+    fullPayload.subarray(requestIdLen, requestIdLen + stdoutLen),
+    fullPayload.subarray(requestIdLen + stdoutLen, requestIdLen + stdoutLen + stderrLen),
+    flags,
   ];
 }
 

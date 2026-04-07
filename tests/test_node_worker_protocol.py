@@ -154,6 +154,25 @@ class NodeWorkerProtocolTests(unittest.TestCase):
         self.assertEqual(error_type, "internal")
         self.assertIn("child exited by signal", stderr)
 
+    def test_node_supervisor_short_payload_is_protocol_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child = Path(tmp) / "short_payload_child.js"
+            child.write_text(
+                "// Header declares stdout=100 bytes but only writes 5 bytes of payload\n"
+                "process.stdout.write('WRK1R 1 0 ok 100 0 0\\n');\n"
+                "process.stdout.write(Buffer.from('x'));\n"
+                "process.stdout.write(Buffer.from('short'));\n",
+                encoding="utf-8",
+            )
+            rid, exit_code, error_type, _stdout, stderr, _flags = self.run_worker(
+                "console.log('ignored')",
+                child_script=child,
+            )
+        self.assertEqual(rid, b"n1")
+        self.assertEqual(exit_code, -1)
+        self.assertEqual(error_type, "protocol")
+        self.assertIn("malformed child response", stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

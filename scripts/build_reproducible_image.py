@@ -2,12 +2,12 @@
 """
 Reproducible Guest Image Builder
 
-Builds deterministic guest rootfs images using a declarative specification.
+Builds deterministic guest rootfs images from a template, package list, or Docker image.
 The resulting images are bit-for-bit reproducible given the same inputs.
 
 Usage:
-    python3 build_reproducible_image.py --spec spec.yaml --output /path/to/output.ext4
-    python3 build_reproducible_image.py --template python3.11 --output /path/to/output.ext4
+    python3 build_reproducible_image.py --template python --output /path/to/output.ext4
+    python3 build_reproducible_image.py --packages pkg1 pkg2 --output /path/to/output.ext4
 
 The builder:
 1. Creates a minimal rootfs from packages
@@ -217,7 +217,6 @@ class ReproducibleBuilder:
 
 def main():
     parser = argparse.ArgumentParser(description="Reproducible Guest Image Builder")
-    parser.add_argument("--spec", type=Path, help="Build specification YAML/JSON")
     parser.add_argument("--template", choices=["python", "node"], 
                         help="Quick template selection")
     parser.add_argument("--packages", nargs="+", help="Package list")
@@ -244,11 +243,8 @@ def main():
             result = builder.build_from_deb(packages, args.output, args.base_image)
         elif args.packages:
             result = builder.build_from_deb(args.packages, args.output, args.base_image)
-        elif args.spec:
-            # TODO: Parse spec file
-            raise NotImplementedError("Spec file parsing not yet implemented")
         else:
-            parser.error("Must specify --template, --packages, --docker-image, or --spec")
+            parser.error("Must specify --template, --packages, or --docker-image")
             
         # Finalize
         manifest = builder.finalize(result.get("image_hash", ""))
