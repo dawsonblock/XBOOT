@@ -6,7 +6,7 @@ Builds deterministic guest rootfs images using a declarative specification.
 The resulting images are bit-for-bit reproducible given the same inputs.
 
 Usage:
-    python3 build_reproducible_image.py --template python3.11 --output /path/to/output.ext4
+    python3 build_reproducible_image.py --template python --output /path/to/output.ext4
     python3 build_reproducible_image.py --packages pkg1 pkg2 --output /path/to/output.ext4
 
 The builder:
