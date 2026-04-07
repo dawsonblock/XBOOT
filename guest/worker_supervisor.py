@@ -86,12 +86,24 @@ def parse_child_response(data: bytes):
         raise ValueError("malformed child response")
     try:
         request_id_len = int(header[1])
+    except ValueError:
+        raise ValueError("malformed child response: non-integer request_id_len field")
+    try:
         exit_code = int(header[2])
+    except ValueError:
+        raise ValueError("malformed child response: non-integer exit_code field")
+    try:
         stdout_len = int(header[4])
+    except ValueError:
+        raise ValueError("malformed child response: non-integer stdout_len field")
+    try:
         stderr_len = int(header[5])
+    except ValueError:
+        raise ValueError("malformed child response: non-integer stderr_len field")
+    try:
         flags = int(header[6])
     except ValueError:
-        raise ValueError("malformed child response: non-integer length field")
+        raise ValueError("malformed child response: non-integer flags field")
     if request_id_len < 0 or stdout_len < 0 or stderr_len < 0:
         raise ValueError("malformed child response: negative length field")
     full_payload = data[newline + 1:]
