@@ -2,7 +2,7 @@
 """
 Reproducible Guest Image Builder
 
-Builds deterministic guest rootfs images using a declarative specification.
+Builds deterministic guest rootfs images from a template, package list, or Docker image.
 The resulting images are bit-for-bit reproducible given the same inputs.
 
 Usage:
